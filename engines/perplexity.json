@@ -37,7 +37,30 @@
       "button[aria-label*='Stop']",
       "button[title*='Stop']",
       "button[role='button'][aria-label*='Pause']"
-    ]
+    ],
+    "limit": [
+      "div.font-serif.text-3xl.leading-[1.3].font-normal.text-foreground.selection\\:bg-super\/50.selection\\:text-foreground.dark\\:selection\\:bg-super\/10.dark\\:selection\\:text-super"
+    ],
+    "base_account_selector": "#root > div > div > div > div > nav > div.relative.size-full.overflow-hidden.border-subtlest.ring-subtlest.divide-subtlest.flex.flex-col > div.w-full.py-xs.border-subtlest.ring-subtlest.divide-subtlest > div > div > div > button > div.absolute.inset-0.flex.items-center.justify-center"
+  },
+  "media_support": {
+    "total_limits": {
+      "limits": {"unlogged": 0, "base": 2, "paid": -1}
+    },
+    "image": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"]
+    },
+    "document": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file']"]
+    }
   },
   "login_detection": {
     "url_prefix": "https://www.perplexity.ai"

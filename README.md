@@ -116,6 +116,48 @@ r = requests.post(url, json=payload)
 print(r.json())
 ```
 
+## Media upload support
+
+`/v1/chat/completions` (and legacy per-engine `/chatgpt/prompt`, `/gemini/prompt`, etc.) accepts multimodal `messages` payloads where a message `content` can be an array of parts:
+
+- `type: "text"` for text content
+- `type: "image_url"` for an inline image using a data URI or raw base64 payload
+- `type: "input_audio"` for audio upload in supported engines
+
+Example `curl` request with an inline image:
+
+```bash
+curl -X POST "http://localhost:14848/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "chatgpt",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "content": "Here is an image:"},
+          {
+            "type": "image_url",
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=",
+            "filename": "example.png"
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+If the chosen engine supports audio uploads, use `type: "input_audio"` with a base64 audio payload and optional `mime_type`:
+
+```json
+{
+  "type": "input_audio",
+  "data": "<base64-audio-data>",
+  "mime_type": "audio/mpeg",
+  "filename": "example.mp3"
+}
+```
+
 3. Prompt example (API call)
 
 Before sending a prompt, make sure you have logged in using `/login/chatgpt` or `/login/gemini`.

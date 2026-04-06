@@ -32,6 +32,22 @@
       "button[aria-label*='Stop']"
     ]
   },
+  "media_support": {
+    "image": {
+      "limits": {"unlogged": 0, "base": 3, "paid": -1},
+      "supported_models": ["not-unlogged"],
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["not-unlogged"]
+    },
+    "document": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["not-unlogged"],
+      "upload_selectors": ["input[type='file']"]
+    }
+  },
   "login_detection": {
     "url_prefix": "https://claude.ai",
     "url_deny_keywords": ["login", "signin", "auth"],

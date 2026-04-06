@@ -5,6 +5,7 @@ import threading
 import time
 import types
 import sys
+from typing import Any
 import pytest
 
 # Some environments may not have distutils installed for undetected_chromedriver.
@@ -23,6 +24,7 @@ client = TestClient(app)
 class DummyEngine:
     def __init__(self):
         self.model = "default"
+        self.last_media: list[Any] = []
 
     def get_interface_limits(self):
         return {"max_prompt_chars": 1234, "model_name": "default"}
@@ -36,7 +38,8 @@ class DummyEngine:
     async def check_login_state(self):
         return {"logged_in": False, "login_state": "unlogged"}
 
-    async def generate_response(self, prompt):
+    async def generate_response(self, prompt, media=None):
+        self.last_media = media or []
         return "dummy response"
 
     def get_current_model(self):
@@ -51,6 +54,7 @@ def setup_engine_manager(monkeypatch):
     monkeypatch.setattr("app.inc_responses", lambda: None)
     monkeypatch.setattr("app.inc_errors", lambda: None)
     monkeypatch.setattr("app.log_prompt", lambda *a, **kw: None)
+    monkeypatch.setattr("app.inc_media_sent", lambda *a, **kw: None)
 
     mgr = EngineManager.get()
     mgr.engines.clear()
@@ -68,6 +72,7 @@ def setup_engine_manager(monkeypatch):
         default_model="default",
         source="builtin",
         source_path="<test>",
+        media_capabilities=["image", "audio"],
     )
     gemini_desc = EngineDescriptor(
         name="gemini",
@@ -78,6 +83,7 @@ def setup_engine_manager(monkeypatch):
         default_model="default",
         source="builtin",
         source_path="<test>",
+        media_capabilities=["image"],
     )
     mgr._descriptors = {"chatgpt": chatgpt_desc, "gemini": gemini_desc}
     mgr._alias_map = {
@@ -120,6 +126,45 @@ def test_models():
         assert entry["object"] == "model"
         # Legacy extra fields still present
         assert "name" in entry
+
+
+def test_parse_media_part_accepts_generic_file():
+    from app import _parse_media_part
+
+    part = {
+        "type": "input_file",
+        "data": "data:text/plain;base64,Zm9vYmFy",
+        "mime_type": "text/plain",
+        "filename": "hello.txt",
+    }
+    item = _parse_media_part(part, 0)
+    assert item.media_type == "document"
+    assert item.mime_type == "text/plain"
+    assert item.filename == "hello.txt"
+    assert item.data == b"foobar"
+
+
+def test_normalize_prompt_payload_includes_input_file():
+    from app import _normalize_prompt_payload
+
+    payload = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "content": "Please read this file."},
+                {
+                    "type": "input_file",
+                    "data": "data:text/plain;base64,Zm9vYmFy",
+                    "mime_type": "text/plain",
+                    "filename": "hello.txt",
+                },
+            ],
+        }
+    ]
+    prompt_text, media_items = _normalize_prompt_payload(payload)
+    assert "Please read this file." in prompt_text
+    assert len(media_items) == 1
+    assert media_items[0].media_type == "document"
 
 
 def test_legacy_chat_completions():
@@ -169,6 +214,38 @@ def test_prompt_dynamic_endpoint_alias():
     assert response.status_code == 200
 
 
+def test_multimodal_text_and_image():
+    image_data = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAA"
+        "AAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "content": "Here is an image:"},
+                        {
+                            "type": "image_url",
+                            "url": f"data:image/png;base64,{image_data}",
+                            "filename": "test.png",
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "chat.completion"
+    engine = EngineManager.get().engines["chatgpt"]
+    assert len(engine.last_media) == 1
+    assert engine.last_media[0].media_type == "image"
+
+
 def test_prompt_unknown_engine():
     response = client.post("/engine/nonexistent/prompt", json={"prompt": "Hello"})
     assert response.status_code == 404
@@ -182,6 +259,20 @@ def test_api_engines():
     names = [e["name"] for e in data["data"]]
     assert "chatgpt" in names
     assert "gemini" in names
+
+
+def test_api_engines_include_media_capabilities():
+    response = client.get("/api/engines")
+    assert response.status_code == 200
+    data = response.json()
+    assert "data" in data
+    for entry in data["data"]:
+        assert "media_capabilities" in entry
+        assert isinstance(entry["media_capabilities"], list)
+
+    chatgpt_entry = next((e for e in data["data"] if e["name"] == "chatgpt"), None)
+    assert chatgpt_entry is not None
+    assert "image" in chatgpt_entry["media_capabilities"]
 
 
 def test_api_engines_reload():
@@ -228,6 +319,343 @@ def test_unlogged_flag_behavior():
     assert unlogged_engine.get_current_model() == "unlogged"
 
 
+def test_media_limits_fallback_without_config():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    media_items = [type("M", (), {"media_type": "image"})()]
+    assert engine._check_media_limits(media_items, "base") is None
+
+
+def test_stepfun_audio_not_supported_by_model():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    with open("engines/stepfun.json", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+
+    engine = SeleniumLLMBase(
+        service_url=cfg["service_url"],
+        model_limits_map=cfg["models"],
+        default_model=cfg.get("default_model", "default"),
+    )
+    engine.media_config = cfg.get("media_support", {})
+    media_items = [type("M", (), {"media_type": "audio"})()]
+    assert engine._check_media_limits(media_items, "paid") is None
+
+
+def test_media_with_model_not_listed_is_allowed_to_try():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000, "other": 1000},
+        default_model="other",
+    )
+    engine.media_config = {
+        "audio": {
+            "limits": {"default": -1},
+            "supported_models": ["default"],
+        }
+    }
+    media_items = [type("M", (), {"media_type": "audio"})()]
+    assert engine._check_media_limits(media_items, "default") is None
+
+
+def test_supported_models_all_allows_every_model():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000, "other": 1000},
+        default_model="other",
+    )
+    engine.media_config = {
+        "audio": {
+            "limits": {"default": -1},
+            "supported_models": ["all"],
+        }
+    }
+    media_items = [type("M", (), {"media_type": "audio"})()]
+    assert engine._check_media_limits(media_items, "default") is None
+
+
+def test_supported_models_not_unlogged_allows_logged_models():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000, "unlogged": 1000},
+        default_model="default",
+    )
+    engine.media_config = {
+        "audio": {
+            "limits": {"default": -1, "unlogged": 0},
+            "supported_models": ["not-unlogged"],
+        }
+    }
+    media_items = [type("M", (), {"media_type": "audio"})()]
+    assert engine._check_media_limits(media_items, "default") is None
+
+
+def test_upload_via_file_input_rejects_missing_value():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"audio": {"upload_selectors": ["input[type='file']"]}}
+    mock_driver = MagicMock()
+    mock_input = MagicMock()
+    mock_input.tag_name = "input"
+    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
+    mock_driver.find_elements.return_value = [mock_input]
+    mock_driver.execute_script.return_value = 0
+
+    result = engine._upload_via_file_input(
+        type("M", (), {"media_type": "audio"})(),
+        "/tmp/dummy.mp3",
+        mock_driver,
+    )
+    assert result is False
+
+
+def test_upload_via_file_input_accepts_file_list():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"audio": {"upload_selectors": ["input[type='file']"]}}
+    mock_driver = MagicMock()
+    mock_input = MagicMock()
+    mock_input.tag_name = "input"
+    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
+    mock_driver.find_elements.return_value = [mock_input]
+    mock_driver.execute_script.return_value = 1
+
+    result = engine._upload_via_file_input(
+        type("M", (), {"media_type": "audio"})(),
+        "/tmp/dummy.mp3",
+        mock_driver,
+    )
+    assert result is True
+
+
+def test_upload_via_file_input_trusts_send_keys_when_spa_clears_files():
+    """Regression: Angular/SPA resets .files/.value after processing; send_keys success should be trusted."""
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
+
+    mock_driver = MagicMock()
+    mock_input = MagicMock()
+    mock_input.tag_name = "input"
+    # type check returns "file"; value (empty, simulating SPA reset)
+    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
+    mock_input.send_keys.return_value = None  # succeeds without exception
+    mock_driver.find_elements.return_value = [mock_input]
+    # files.length always returns 0 (SPA already cleared the FileList)
+    mock_driver.execute_script.return_value = 0
+
+    result = engine._upload_via_file_input(
+        type("M", (), {"media_type": "image"})(),
+        "/tmp/dummy.png",
+        mock_driver,
+    )
+
+    assert result is True, "Should trust send_keys success even when SPA clears .files"
+
+
+def test_upload_via_clipboard_uses_popen_for_xclip():
+    """Regression: xclip -i blocks until clipboard is read; must use Popen, not run."""
+    import os
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock, patch
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.prompt_area_selectors = ["textarea"]
+
+    mock_driver = MagicMock()
+    mock_input_el = MagicMock()
+    engine._find_interactable_element = MagicMock(return_value=mock_input_el)
+
+    mock_proc = MagicMock()
+    item = type("M", (), {"media_type": "image", "mime_type": "image/png"})()
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp.write(b"\x89PNG")
+    tmp.close()
+
+    try:
+        with patch("shutil.which", side_effect=lambda cmd: cmd if cmd == "xclip" else None), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch("subprocess.run") as mock_run:
+            result = engine._upload_via_clipboard(item, tmp.path if hasattr(tmp, "path") else tmp.name, mock_driver)
+        assert result is True
+        # Popen must be called (non-blocking); subprocess.run must NOT be called for xclip
+        mock_popen.assert_called_once()
+        mock_run.assert_not_called()
+        # xclip process must be terminated after paste
+        mock_proc.terminate.assert_called_once()
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_upload_via_file_input_attempts_visibility_fallback_for_hidden_inputs():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
+
+    mock_driver = MagicMock()
+    mock_input = MagicMock()
+    mock_input.tag_name = "input"
+    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
+    mock_input.send_keys.side_effect = [Exception("element not interactable"), None]
+    mock_driver.find_elements.return_value = [mock_input]
+    mock_driver.execute_script.return_value = 1
+
+    result = engine._upload_via_file_input(
+        type("M", (), {"media_type": "image"})(),
+        "/tmp/dummy.png",
+        mock_driver,
+    )
+
+    assert result is True
+    assert mock_driver.execute_script.called
+
+
+def test_upload_media_returns_false_when_all_upload_paths_fail():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"audio": {"upload_selectors": ["input[type='file']"]}}
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = []
+
+    result = engine._upload_media(
+        [type("M", (), {"media_type": "audio", "mime_type": "audio/mpeg", "data": b"dummy"})()],
+        mock_driver,
+    )
+    assert result is False
+
+
+def test_upload_media_clicks_accept_buttons_after_successful_upload():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
+
+    mock_driver = MagicMock()
+    mock_input = MagicMock()
+    mock_input.tag_name = "input"
+    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
+    mock_input.send_keys.return_value = None
+    mock_driver.find_elements.side_effect = (
+        lambda by, sel: [mock_input] if sel == "input[type='file']" else []
+    )
+    engine._click_accept_buttons = MagicMock()
+
+    result = engine._upload_media(
+        [type("M", (), {"media_type": "image", "mime_type": "image/png", "data": b"dummy"})()],
+        mock_driver,
+    )
+
+    assert result is True
+    engine._click_accept_buttons.assert_called_once_with(mock_driver, timeout=5.0)
+
+
+def test_sync_generate_response_once_returns_error_when_send_button_not_ready_after_media_upload():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.driver = MagicMock()
+    engine.service_url = "https://example.com"
+    engine._ensure_ready = lambda: None
+    engine.is_user_logged_in = lambda: True
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+    engine._check_account_tier = lambda driver: "base"
+    engine._check_media_limits = lambda media, tier: None
+    engine._upload_media = lambda media, driver: True
+    engine._find_interactable_element = lambda driver, selectors, timeout, cache_attr=None: MagicMock()
+    engine._fill_input = lambda driver, element, text: None
+    engine._wait_for_send_button_after_media_upload = lambda driver: False
+    engine._click_send = lambda driver, element: None
+    engine._post_send_check = lambda driver: True
+    engine._wait_for_response = lambda driver: "response"
+
+    result = engine._sync_generate_response_once("Hello", [type(
+        "M", (), {"media_type": "audio", "mime_type": "audio/mpeg", "data": b"dummy"}
+    )()])
+    assert result == "⚠️ Media upload failed. Please verify the file and try again."
+
+
+def test_total_media_limit_applies_across_types():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {
+        "total_limits": {"limits": {"default": 2}},
+        "image": {"limits": {"default": -1}},
+        "audio": {"limits": {"default": -1}},
+    }
+    media_items = [
+        type("M", (), {"media_type": "image"})(),
+        type("M", (), {"media_type": "audio"})(),
+        type("M", (), {"media_type": "image"})(),
+    ]
+
+    assert engine._check_media_limits(media_items, "default") == (
+        "⚠️ The use of 'media' is exhausted for today. Please try again tomorrow."
+    )
+
+
 def test_reset_state():
     manager = EngineManager.get()
     # set active engine then verify reset clears it
@@ -250,6 +678,50 @@ def test_reset_state():
     assert "global_avg_ms" in stats_data["response_time"]
     assert "per_engine_avg_ms" in stats_data["response_time"]
     assert isinstance(stats_data["response_time"]["per_engine_avg_ms"], dict)
+
+
+def test_media_counter_increments_on_prompt_with_media(monkeypatch):
+    called = {"count": 0, "amount": 0}
+    def record(amount):
+        called["count"] += 1
+        called["amount"] = amount
+    monkeypatch.setattr("app.inc_media_sent", record)
+
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "content": "hello"},
+                    {"type": "image", "data": "data:image/png;base64,AAAA"},
+                ],
+            }
+        ]
+    }
+    response = client.post("/engine/chatgpt/prompt", json=payload)
+    assert response.status_code == 200
+    assert called["count"] == 1
+    assert called["amount"] == 1
+
+
+def test_stats_returns_media_availability_by_tier():
+    mgr = EngineManager.get()
+    chatgpt_desc = mgr._descriptors["chatgpt"]
+    gemini_desc = mgr._descriptors["gemini"]
+    chatgpt_desc.media_support = {
+        "image": {"limits": {"unlogged": 0, "base": -1, "paid": -1}}
+    }
+    gemini_desc.media_support = {
+        "audio": {"limits": {"unlogged": 0, "base": 2, "paid": 0}}
+    }
+
+    response = client.get("/stats")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["media_sent_today"] == 0
+    assert data["media_availability"]["unlogged"] == 0
+    assert data["media_availability"]["base"] == 4
+    assert data["media_availability"]["paid"] == -1
 
 
 def test_api_reset_alias():
@@ -355,7 +827,7 @@ def test_captcha_detection_short_circuit(monkeypatch):
 
     result = engine._sync_generate_response_once("Hello")
     assert "CAPTCHA" in result or "captcha" in result
-    assert "completa" in result
+    assert "Please complete" in result
 
 
 def test_check_login_state_no_browser_launch_when_uninitialized():
@@ -693,6 +1165,44 @@ def test_find_interactable_element_tries_cached_first():
     assert tried_order[0] == cached_sel, "Cached selector must be tried first"
 
 
+def test_find_interactable_element_falls_back_to_visible_non_clickable_element():
+    try:
+        from core.selenium_llm_base import SeleniumLLMBase
+    except ModuleNotFoundError:
+        pytest.skip("undetected_chromedriver not compatible with this Python version")
+
+    from unittest.mock import MagicMock, patch
+    from selenium.common.exceptions import TimeoutException
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+
+    mock_driver = MagicMock()
+    visible_element = MagicMock()
+    visible_element.is_displayed.return_value = True
+
+    def fake_wait_until(condition):
+        raise TimeoutException()
+
+    mock_wait = MagicMock()
+    mock_wait.until.side_effect = fake_wait_until
+
+    with patch("core.selenium_llm_base.WebDriverWait", return_value=mock_wait):
+        mock_driver.find_elements.return_value = [visible_element]
+        result = base._find_interactable_element(
+            mock_driver,
+            ["div[contenteditable='true']"],
+            timeout=2.0,
+            cache_attr="_cached_prompt_selector",
+        )
+
+    assert result == visible_element
+    assert base._cached_prompt_selector == "div[contenteditable='true']"
+
+
 def test_find_interactable_element_handles_stale_cached_selector():
     """If cached selector raises StaleElementReferenceException then fallback is used."""
     try:
@@ -788,6 +1298,138 @@ def test_click_send_handles_stale_first_selector():
         base._click_send(mock_driver, MagicMock())
 
     assert base._cached_send_selector == "button.send2"
+
+
+def test_wait_for_send_button_after_media_upload_returns_true_when_button_appears():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    mock_driver = MagicMock()
+    fake_button = MagicMock()
+    fake_button.is_displayed.return_value = True
+    fake_button.is_enabled.return_value = True
+    mock_driver.find_elements.side_effect = [[], [fake_button]]
+
+    result = base._wait_for_send_button_after_media_upload(mock_driver, timeout=1.0)
+
+    assert result is True
+    assert mock_driver.find_elements.call_count == 2
+
+
+def test_wait_for_send_button_after_media_upload_times_out_when_button_never_appears():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = []
+
+    result = base._wait_for_send_button_after_media_upload(mock_driver, timeout=0.1)
+
+    assert result is False
+
+
+def test_wait_for_media_upload_complete_waits_for_selector_presence():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    base.media_config = {
+        "image": {
+            "upload_complete_selectors": ["div.upload-preview"]
+        }
+    }
+    mock_driver = MagicMock()
+    fake_element = MagicMock()
+    fake_element.is_displayed.return_value = True
+    mock_driver.find_elements.side_effect = [[], [fake_element]]
+
+    result = base._wait_for_media_upload_complete(
+        type("M", (), {"media_type": "image"})(),
+        mock_driver,
+        timeout=1.0,
+    )
+
+    assert result is True
+    assert mock_driver.find_elements.call_count == 2
+
+
+def test_wait_for_media_upload_complete_waits_for_selector_absence():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    base.media_config = {
+        "image": {
+            "upload_complete_selectors": ["!upload-image-disclaimer-dialog"]
+        }
+    }
+    mock_driver = MagicMock()
+    fake_element = MagicMock()
+    fake_element.is_displayed.return_value = True
+    mock_driver.find_elements.side_effect = [[fake_element], []]
+
+    result = base._wait_for_media_upload_complete(
+        type("M", (), {"media_type": "image"})(),
+        mock_driver,
+        timeout=1.0,
+    )
+
+    assert result is True
+    assert mock_driver.find_elements.call_count == 2
+
+
+def test_is_limit_present_detects_limit_warning():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    base.limit_selectors = ["div.limit-warning"]
+
+    fake_element = MagicMock()
+    fake_element.is_displayed.return_value = True
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = [fake_element]
+
+    assert base._is_limit_present(mock_driver) is True
+
+
+def test_is_limit_present_returns_false_when_no_limit_warning():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    base.limit_selectors = ["div.limit-warning"]
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = []
+
+    assert base._is_limit_present(mock_driver) is False
 
 
 # ---------------------------------------------------------------------------

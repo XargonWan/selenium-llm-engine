@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import threading
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Set
 
@@ -18,12 +21,14 @@ from db.db import (
     clear_prompt_logs,
     clear_stats,
     get_logged_engines,
+    get_media_sent_today,
     get_prompt_logs,
     get_response_time_stats,
     get_stats,
     init_database,
     log_prompt,
     inc_errors,
+    inc_media_sent,
     inc_requests,
     inc_responses,
 )
@@ -67,6 +72,133 @@ class _BufferHandler(logging.Handler):
                 )
         except Exception:
             self.handleError(record)
+
+
+@dataclass
+class MediaItem:
+    media_type: str
+    data: bytes
+    mime_type: str
+    filename: str
+
+
+def _parse_data_uri(data_uri: str) -> tuple[bytes, str]:
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        raise ValueError("Invalid data URI")
+    header, _, payload = data_uri.partition(",")
+    if not payload:
+        raise ValueError("Malformed data URI")
+    if ";base64" not in header:
+        raise ValueError("Only base64-encoded data URIs are supported")
+    mime_type = header[5:].split(";", 1)[0] or "application/octet-stream"
+    return base64.b64decode(payload), mime_type
+
+
+def _guess_filename(media_type: str, mime_type: str, index: int) -> str:
+    extension = mimetypes.guess_extension(mime_type) or ""
+    if not extension:
+        extension = ".bin"
+    return f"{media_type}_{index}{extension}"
+
+
+def _parse_media_part(part: dict, index: int) -> MediaItem:
+    raw_media_type = str(part.get("type", "")).strip()
+    if raw_media_type in ("image_url", "image"):
+        media_type = "image"
+    elif raw_media_type in ("input_audio", "audio"):
+        media_type = "audio"
+    elif raw_media_type in ("input_file", "file", "document", "input_document"):
+        media_type = "document"
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported media type: {raw_media_type}")
+
+    if media_type == "image":
+        source = part.get("url") or part.get("data")
+        if not source:
+            raise HTTPException(status_code=400, detail="Missing image URL or data")
+    else:
+        source = part.get("data")
+        if not source:
+            raise HTTPException(status_code=400, detail="Missing file data")
+
+    if isinstance(source, str) and source.startswith("data:"):
+        try:
+            data, mime_type = _parse_data_uri(source)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif isinstance(source, str):
+        try:
+            data = base64.b64decode(source)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid base64 media data") from exc
+        if media_type == "audio":
+            mime_type = part.get("mime_type") or "audio/mpeg"
+        else:
+            mime_type = part.get("mime_type") or "application/octet-stream"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported media payload format")
+
+    filename = str(part.get("filename") or _guess_filename(media_type, mime_type, index))
+    return MediaItem(media_type=media_type, data=data, mime_type=mime_type, filename=filename)
+
+
+def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
+    prompt_text = ""
+    media_items: list[MediaItem] = []
+
+    if isinstance(payload, dict) and "role" in payload and "content" in payload:
+        payload = [payload]
+
+    if isinstance(payload, list):
+        system_parts: list[str] = []
+        user_parts: list[str] = []
+        for message in payload:
+            role = "user"
+            content = message
+            if isinstance(message, dict):
+                role = str(message.get("role", "user"))
+                content = message.get("content", "")
+
+            message_text = ""
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in (
+                        "text",
+                        "image_url",
+                        "image",
+                        "input_audio",
+                        "audio",
+                        "input_file",
+                        "file",
+                    ):
+                        if part.get("type") == "text":
+                            message_text += str(part.get("content", ""))
+                        else:
+                            media_items.append(_parse_media_part(part, len(media_items)))
+                    else:
+                        message_text += str(part)
+            else:
+                message_text = str(content)
+
+            if role == "system":
+                if message_text:
+                    system_parts.append(message_text)
+            else:
+                if message_text:
+                    user_parts.append(message_text)
+
+        parts: list[str] = []
+        if system_parts:
+            parts.append("[INSTRUCTIONS]:\n" + "\n\n".join(system_parts))
+        if user_parts:
+            parts.extend(user_parts)
+        prompt_text = "\n\n".join(parts)
+    else:
+        prompt_text = str(payload)
+
+    if not prompt_text and media_items:
+        prompt_text = "[Media attachments included]"
+    return prompt_text, media_items
 
 
 _buf_handler = _BufferHandler()
@@ -472,31 +604,16 @@ async def _prompt(
 
     if explicit_prompt is None:
         payload = await _safe_parse_json(req)
-        prompt_text = payload.get("prompt") or payload.get("messages")
+        prompt_payload = payload.get("prompt") or payload.get("messages")
     else:
-        prompt_text = explicit_prompt
+        prompt_payload = explicit_prompt
 
-    if not prompt_text:
+    if prompt_payload is None:
         raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
-    if isinstance(prompt_text, list):
-        system_parts: list[str] = []
-        user_parts: list[str] = []
-        for x in prompt_text:
-            if isinstance(x, dict):
-                role = x.get("role", "user")
-                content = x.get("content", "")
-                if role == "system":
-                    system_parts.append(content)
-                else:
-                    user_parts.append(content)
-            else:
-                user_parts.append(str(x))
-        parts: list[str] = []
-        if system_parts:
-            parts.append("[INSTRUCTIONS]:\n" + "\n\n".join(system_parts))
-        parts.extend(user_parts)
-        prompt_text = "\n\n".join(parts)
+    prompt_text, media_items = _normalize_prompt_payload(prompt_payload)
+    if not prompt_text and not media_items:
+        raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
     if not isinstance(prompt_text, str):
         prompt_text = str(prompt_text)
@@ -514,8 +631,10 @@ async def _prompt(
 
             async def generate_stream():
                 try:
-                    result_obj = await mgr.enqueue(engine_name, prompt_text)
+                    result_obj = await mgr.enqueue(engine_name, prompt_text, media_items)
                     elapsed_ms = int((time.time() - start) * 1000)
+                    if media_items:
+                        inc_media_sent(len(media_items))
                     log_prompt(
                         engine_name,
                         result_obj.model_name,
@@ -541,8 +660,10 @@ async def _prompt(
 
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
-        result_obj = await mgr.enqueue(engine_name, prompt_text)
+        result_obj = await mgr.enqueue(engine_name, prompt_text, media_items)
         duration_ms = int((time.time() - start) * 1000)
+        if media_items:
+            inc_media_sent(len(media_items))
         log_prompt(
             engine_name,
             result_obj.model_name,
@@ -585,10 +706,51 @@ async def _prompt(
             _unregister_task(current_task)
 
 
+def _get_media_availability() -> Dict[str, int]:
+    mgr = EngineManager.get()
+    totals = {"unlogged": 0, "base": 0, "paid": 0}
+    unlimited = {"unlogged": False, "paid": False}
+    for desc in mgr._descriptors.values():
+        media_support = getattr(desc, "media_support", {}) or {}
+        if not isinstance(media_support, dict):
+            continue
+        engine_totals = {"unlogged": 0, "base": 0, "paid": 0}
+        engine_unknown_base = False
+        for cfg in media_support.values():
+            if not isinstance(cfg, dict):
+                continue
+            limits = cfg.get("limits", {})
+            if not isinstance(limits, dict):
+                continue
+            for tier in engine_totals:
+                value = limits.get(tier)
+                if value == -1:
+                    if tier == "base":
+                        engine_unknown_base = True
+                    else:
+                        unlimited[tier] = True
+                elif isinstance(value, int) and value > 0:
+                    engine_totals[tier] += value
+        totals["base"] += engine_totals["base"]
+        if engine_unknown_base:
+            totals["base"] += 2
+        totals["unlogged"] += engine_totals["unlogged"]
+        totals["paid"] += engine_totals["paid"]
+    result: Dict[str, int] = {}
+    for tier, amount in totals.items():
+        if tier in unlimited and unlimited[tier]:
+            result[tier] = -1
+        else:
+            result[tier] = amount
+    return result
+
+
 @app.get("/stats")
 async def stats() -> Dict[str, Any]:
     return {
         "stats": get_stats(),
+        "media_sent_today": get_media_sent_today(),
+        "media_availability": _get_media_availability(),
         "logged_engines": get_logged_engines(),
         "response_time": get_response_time_stats(),
     }

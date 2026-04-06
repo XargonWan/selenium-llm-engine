@@ -115,6 +115,36 @@ matches a clickable element.
 - Prefer `data-testid` or `aria-label` attributes — they are more stable than class names.
 - Add multiple fallback selectors from most specific to least specific.
 
+#### `media_support`
+
+Optional media support rules for engines that can upload or paste images, audio, or documents.
+Each supported media type is a key mapping to an object with optional limits and model filters.
+
+```json
+"media_support": {
+  "image": {
+    "limits": {"unlogged": 0, "base": 3, "paid": -1},
+    "supported_models": ["default", "all"]
+  },
+  "audio": {
+    "limits": {"unlogged": 0, "base": -1, "paid": -1},
+    "supported_models": ["not-unlogged"]
+  }
+}
+```
+
+Supported keys in each media entry:
+
+- `limits` — per-tier upload limits. Use `-1` for unlimited; a tier limit of `0` means the engine should still attempt the upload flow before failing.
+- `supported_models` — optional model whitelist. Special values:
+  - `"all"` — all models are considered supported.
+  - `"not-unlogged"` — any logged-in model is considered supported, but `unlogged` is not.
+  - normal model slugs like `"default"`, `"gpt-4o"`, or `"unlogged"`.
+
+If `supported_models` is present, the engine will still attempt the upload flow even when
+the current model is not listed; this is a hint to developers, not a hard reject.
+Only explicit limits or missing media type entries are treated as hard failures.
+
 #### `login_detection`
 
 Controls how the engine decides whether the browser session is logged in.

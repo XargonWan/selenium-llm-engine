@@ -3,6 +3,7 @@
   "display_name": "ChatGPT (OpenAI)",
   "aliases": ["chatgpt", "openai", "gpt"],
   "service_url": "https://chat.openai.com",
+  "notes": "Media support disabled for this engine because file uploads depend on files.oaiusercontent.com, which is blocked or unavailable in the current environment.",
   "default_model": "gpt-4o",
   "allow_unlogged": true,
   "models": {
@@ -41,7 +42,26 @@
       "button[data-testid='stop-button']",
       "button[aria-label='Stop generating']",
       "button[aria-label*='Stop']"
+    ],
+    "base_account_selector": [
+      "div.leading-dense.mb-0.5.text-xs.whitespace-normal span.inline-flex.items-center.gap-1.truncate.text-xs.font-normal.text-token-text-tertiary[dir='auto']"
     ]
+  },
+  "media_support": {
+    "image": {
+      "limits": {"unlogged": 0, "base": 0, "paid": 0},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": 0, "paid": 0},
+      "supported_models": ["all"]
+    },
+    "document": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file']"]
+    }
   },
   "login_detection": {
     "url_prefix": "https://chat.openai.com",
