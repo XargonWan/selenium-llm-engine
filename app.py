@@ -107,6 +107,8 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
         media_type = "image"
     elif raw_media_type in ("input_audio", "audio"):
         media_type = "audio"
+    elif raw_media_type in ("input_file", "file", "document", "input_document"):
+        media_type = "document"
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported media type: {raw_media_type}")
 
@@ -117,7 +119,7 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
     else:
         source = part.get("data")
         if not source:
-            raise HTTPException(status_code=400, detail="Missing audio data")
+            raise HTTPException(status_code=400, detail="Missing file data")
 
     if isinstance(source, str) and source.startswith("data:"):
         try:
@@ -166,6 +168,8 @@ def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
                         "image",
                         "input_audio",
                         "audio",
+                        "input_file",
+                        "file",
                     ):
                         if part.get("type") == "text":
                             message_text += str(part.get("content", ""))

@@ -43,7 +43,8 @@
       "div[class*='response-text']"
     ],
     "accept_button": [
-      "button[data-test-id='upload-image-agree-button']"
+      "upload-image-disclaimer-dialog button[data-test-id='upload-image-agree-button']",
+      "upload-image-disclaimer-dialog button[aria-label*='Agree']"
     ],
     "stop": [
       "button[aria-label='Stop response']",
@@ -57,11 +58,18 @@
     "image": {
       "limits": {"unlogged": 0, "base": 3, "paid": -1},
       "supported_models": ["all"],
-      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"],
+      "upload_complete_selectors": ["!upload-image-disclaimer-dialog"]
     },
     "audio": {
       "limits": {"unlogged": 0, "base": -1, "paid": -1},
       "supported_models": ["all"]
+    },
+    "document": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file']"],
+      "upload_complete_selectors": ["!upload-image-disclaimer-dialog"]
     }
   },
   "login_detection": {

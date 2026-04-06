@@ -355,7 +355,7 @@
             <label>Prompt</label>
             <textarea id="prompt-input" rows="4" placeholder="Type prompt…"></textarea>
             <label>Media attachments</label>
-            <input id="media-input" type="file" multiple accept="image/*,audio/*" onchange="_renderMediaList()" />
+            <input id="media-input" type="file" multiple onchange="_renderMediaList()" />
             <div id="media-list" style="font-size:0.85rem; color:var(--text-muted); margin-top:6px;">No media selected.</div>
             <button class="primary" onclick="sendPrompt()" style="margin-top:8px; width:100%;">Send</button>
             <h3>Response</h3>
@@ -784,6 +784,13 @@
                         type: 'input_audio',
                         data: dataUrl,
                         mime_type: file.type || 'audio/mpeg',
+                        filename: file.name,
+                    });
+                } else {
+                    parts.push({
+                        type: 'input_file',
+                        data: dataUrl,
+                        mime_type: file.type || 'application/octet-stream',
                         filename: file.name,
                     });
                 }

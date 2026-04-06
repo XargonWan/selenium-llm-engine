@@ -49,6 +49,11 @@
     "audio": {
       "limits": {"unlogged": 0, "base": -1, "paid": -1},
       "supported_models": ["all"]
+    },
+    "document": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file']"]
     }
   },
   "login_detection": {

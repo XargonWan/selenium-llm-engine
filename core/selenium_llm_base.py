@@ -914,6 +914,57 @@ class SeleniumLLMBase:
         except Exception:
             return False
 
+    def _wait_for_media_upload_complete(
+        self,
+        item: Any,
+        driver: Any,
+        timeout: float = 20.0,
+    ) -> bool:
+        selectors = self.media_config.get(item.media_type, {}).get(
+            "upload_complete_selectors", []
+        )
+        if not selectors:
+            return True
+
+        start = time.time()
+        timeout = float(os.getenv("SELENIUM_MEDIA_UPLOAD_COMPLETE_WAIT", str(timeout)))
+        deadline = start + timeout
+
+        while time.time() < deadline:
+            all_satisfied = True
+            for sel in selectors:
+                absent = False
+                raw_sel = sel
+                if sel.startswith("!"):
+                    absent = True
+                    raw_sel = sel[1:]
+
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, raw_sel)
+                except Exception:
+                    elements = []
+
+                if absent:
+                    if elements:
+                        all_satisfied = False
+                        break
+                else:
+                    if not any(self._element_is_displayed(el) for el in elements):
+                        all_satisfied = False
+                        break
+
+            if all_satisfied:
+                logger.debug(
+                    f"[selenium] Media upload completion selectors satisfied: {selectors}"
+                )
+                return True
+            time.sleep(0.25)
+
+        logger.warning(
+            f"[selenium] Media upload completion wait timed out for selectors: {selectors}"
+        )
+        return False
+
     def _upload_media(self, media: list[Any], driver: Any) -> bool:
         for item in media:
             tmp_path = self._write_temp_media_file(item)
@@ -925,6 +976,17 @@ class SeleniumLLMBase:
                 if not upload_success:
                     logger.warning(
                         f"[selenium] Media upload failed for type '{item.media_type}'"
+                    )
+                    return False
+
+                # Some services display an intermediate consent/dialog step after
+                # the file is selected. Click any configured agree/accept buttons
+                # immediately before continuing the prompt flow.
+                self._click_accept_buttons(driver, timeout=5.0)
+
+                if not self._wait_for_media_upload_complete(item, driver):
+                    logger.warning(
+                        f"[selenium] Media upload did not reach completion state for type '{item.media_type}'"
                     )
                     return False
             finally:

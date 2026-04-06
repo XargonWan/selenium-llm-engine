@@ -128,6 +128,45 @@ def test_models():
         assert "name" in entry
 
 
+def test_parse_media_part_accepts_generic_file():
+    from app import _parse_media_part
+
+    part = {
+        "type": "input_file",
+        "data": "data:text/plain;base64,Zm9vYmFy",
+        "mime_type": "text/plain",
+        "filename": "hello.txt",
+    }
+    item = _parse_media_part(part, 0)
+    assert item.media_type == "document"
+    assert item.mime_type == "text/plain"
+    assert item.filename == "hello.txt"
+    assert item.data == b"foobar"
+
+
+def test_normalize_prompt_payload_includes_input_file():
+    from app import _normalize_prompt_payload
+
+    payload = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "content": "Please read this file."},
+                {
+                    "type": "input_file",
+                    "data": "data:text/plain;base64,Zm9vYmFy",
+                    "mime_type": "text/plain",
+                    "filename": "hello.txt",
+                },
+            ],
+        }
+    ]
+    prompt_text, media_items = _normalize_prompt_payload(payload)
+    assert "Please read this file." in prompt_text
+    assert len(media_items) == 1
+    assert media_items[0].media_type == "document"
+
+
 def test_legacy_chat_completions():
     """POST /chat/completions (without /v1) must work as alias."""
     response = client.post(
@@ -530,6 +569,36 @@ def test_upload_media_returns_false_when_all_upload_paths_fail():
         mock_driver,
     )
     assert result is False
+
+
+def test_upload_media_clicks_accept_buttons_after_successful_upload():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
+
+    mock_driver = MagicMock()
+    mock_input = MagicMock()
+    mock_input.tag_name = "input"
+    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
+    mock_input.send_keys.return_value = None
+    mock_driver.find_elements.side_effect = (
+        lambda by, sel: [mock_input] if sel == "input[type='file']" else []
+    )
+    engine._click_accept_buttons = MagicMock()
+
+    result = engine._upload_media(
+        [type("M", (), {"media_type": "image", "mime_type": "image/png", "data": b"dummy"})()],
+        mock_driver,
+    )
+
+    assert result is True
+    engine._click_accept_buttons.assert_called_once_with(mock_driver, timeout=5.0)
 
 
 def test_sync_generate_response_once_returns_error_when_send_button_not_ready_after_media_upload():
@@ -1267,6 +1336,64 @@ def test_wait_for_send_button_after_media_upload_times_out_when_button_never_app
     result = base._wait_for_send_button_after_media_upload(mock_driver, timeout=0.1)
 
     assert result is False
+
+
+def test_wait_for_media_upload_complete_waits_for_selector_presence():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    base.media_config = {
+        "image": {
+            "upload_complete_selectors": ["div.upload-preview"]
+        }
+    }
+    mock_driver = MagicMock()
+    fake_element = MagicMock()
+    fake_element.is_displayed.return_value = True
+    mock_driver.find_elements.side_effect = [[], [fake_element]]
+
+    result = base._wait_for_media_upload_complete(
+        type("M", (), {"media_type": "image"})(),
+        mock_driver,
+        timeout=1.0,
+    )
+
+    assert result is True
+    assert mock_driver.find_elements.call_count == 2
+
+
+def test_wait_for_media_upload_complete_waits_for_selector_absence():
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    base.media_config = {
+        "image": {
+            "upload_complete_selectors": ["!upload-image-disclaimer-dialog"]
+        }
+    }
+    mock_driver = MagicMock()
+    fake_element = MagicMock()
+    fake_element.is_displayed.return_value = True
+    mock_driver.find_elements.side_effect = [[fake_element], []]
+
+    result = base._wait_for_media_upload_complete(
+        type("M", (), {"media_type": "image"})(),
+        mock_driver,
+        timeout=1.0,
+    )
+
+    assert result is True
+    assert mock_driver.find_elements.call_count == 2
 
 
 def test_is_limit_present_detects_limit_warning():
