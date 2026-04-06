@@ -52,7 +52,7 @@ docker pull xargonwan/selenium-llm-engine:latest
 
 docker run -d --name selenium-llm-engine \
   -p 14848:8000 \
-  -p 3006:3000 \
+  -p 3001:3000 \
   -v data:/app/data \
   -v config:/config \
   xargonwan/selenium-llm-engine:latest
@@ -203,7 +203,7 @@ cd selenium-llm-engine
 docker compose up --build
 ```
 
-This runs the same service under `http://localhost:14848` (and `http://localhost:3006` for webtop).
+This runs the same service under `http://localhost:14848` (and `http://localhost:3001` for webtop).
 
 ## Notes
 
