@@ -47,6 +47,17 @@
       "button[aria-label*='Stop']"
     ]
   },
+  "media_support": {
+    "image": {
+      "limits": {"unlogged": 0, "base": 3, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": 0, "paid": 0},
+      "supported_models": []
+    }
+  },
   "login_detection": {
     "url_prefix": "https://stepfun.ai",
     "url_deny_keywords": ["signin", "login"],

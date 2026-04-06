@@ -172,6 +172,10 @@
         .badge-python  { background: #cce5ff; color: #004085; }
         .badge-builtin { background: #fff3cd; color: #856404; }
         .badge-logged  { background: #6d28d9; color: #ffffff; }
+        .badge-capability { background: #e2e8f0; color: #1f2937; }
+        .badge-capability-image { background: #d1fae5; color: #065f46; }
+        .badge-capability-audio { background: #e0f2fe; color: #075985; }
+        .badge-capability-document { background: #f8d7da; color: #7f1d1d; }
 
         html[data-theme="dark"] .badge-json    { background: #1a3a26; color: #6ee7b7; }
         html[data-theme="dark"] .badge-python  { background: #1a2a4a; color: #93c5fd; }
@@ -297,6 +301,10 @@
                     <tr><td>Requests sent</td><td id="stat-requests">&#x2014;</td></tr>
                     <tr><td>Responses OK</td><td id="stat-responses">&#x2014;</td></tr>
                     <tr><td>Errors</td><td id="stat-errors">&#x2014;</td></tr>
+                    <tr><td>Media sent today</td><td id="stat-media-sent">&#x2014;</td></tr>
+                    <tr><td>Availability (unlogged)</td><td id="stat-media-unlogged">&#x2014;</td></tr>
+                    <tr><td>Availability (base)</td><td id="stat-media-base">&#x2014;</td></tr>
+                    <tr><td>Availability (paid)</td><td id="stat-media-paid">&#x2014;</td></tr>
                     <tr><td>Success rate</td><td id="stat-rate">&#x2014;</td></tr>
                     <tr><td>Avg response time (global)</td><td id="stat-avg-ms">&#x2014;</td></tr>
                     <tr><td>Avg response time (per engine)</td><td id="stat-per-engine-ms">&#x2014;</td></tr>
@@ -346,6 +354,9 @@
             <div id="engine-default-info" style="margin-top:4px; color:#666; font-size:0.9rem;">Default engine: none</div>
             <label>Prompt</label>
             <textarea id="prompt-input" rows="4" placeholder="Type prompt…"></textarea>
+            <label>Media attachments</label>
+            <input id="media-input" type="file" multiple accept="image/*,audio/*" onchange="_renderMediaList()" />
+            <div id="media-list" style="font-size:0.85rem; color:var(--text-muted); margin-top:6px;">No media selected.</div>
             <button class="primary" onclick="sendPrompt()" style="margin-top:8px; width:100%;">Send</button>
             <h3>Response</h3>
             <pre id="response-box">&#x2014;</pre>
@@ -507,11 +518,12 @@
             // Use manual per-engine "Check state" button or the global refresh button.
         }
 
-        function _sourceBadge(src) {
-            if (src === 'json')    return '<span class="badge badge-json">JSON</span>';
-            if (src === 'python')  return '<span class="badge badge-python">Python</span>';
-            if (src === 'builtin') return '<span class="badge badge-builtin">built-in</span>';
-            return '';
+        function _capabilityBadges(caps) {
+            if (!Array.isArray(caps) || caps.length === 0) return '';
+            return caps.map(function(cap) {
+                var label = cap.charAt(0).toUpperCase() + cap.slice(1);
+                return '<span class="badge badge-capability badge-capability-' + cap + '">' + label + '</span>';
+            }).join(' ');
         }
 
         function renderEnginesList() {
@@ -534,13 +546,14 @@
                 var loggedBadge = _loggedEngines.has(eng.name)
                     ? '<span class="badge badge-logged">Logged</span>'
                     : '';
+                var capabilityBadges = _capabilityBadges(eng.media_capabilities);
                 return '<div class="engine-card">'
-                    + '<h3>' + (eng.display_name || eng.name) + ' '
-                    +   _sourceBadge(eng.source) + loggedBadge + '</h3>'
+                    + '<h3>' + (eng.display_name || eng.name) + ' ' + loggedBadge + '</h3>'
                     + '<div class="engine-meta"><b>ID:</b> <code>' + eng.name + '</code>'
                     + (aliases ? ' &nbsp;&bull;&nbsp; <b>Aliases:</b> ' + aliases : '') + '</div>'
                     + '<div class="engine-meta"><b>URL:</b> <a href="' + (eng.service_url||'#') + '" target="_blank" rel="noopener">' + (eng.service_url||'&mdash;') + '</a></div>'
                     + '<div class="engine-meta"><b>Models:</b> ' + (modelList||'&mdash;') + '</div>'
+                    + (capabilityBadges ? '<div class="engine-meta"><b>Capabilities:</b> ' + capabilityBadges + '</div>' : '')
                     + (eng.notes ? '<div class="engine-meta"><b>Notes:</b> ' + escapeHtml(eng.notes) + '</div>' : '')
                     + fileLine
                     + '<div class="engine-actions">'
@@ -650,6 +663,10 @@
         // ----------------------------------------------------------------
         // Stats
         // ----------------------------------------------------------------
+        function _formatAvailability(value) {
+            return value === -1 ? 'Unlimited' : value === null || value === undefined ? '—' : value;
+        }
+
         async function refreshStats() {
             try {
                 var data = await fetchJson('/stats');
@@ -663,6 +680,11 @@
                 document.getElementById('stat-responses').textContent = resp;
                 document.getElementById('stat-errors').textContent    = errs;
                 document.getElementById('stat-rate').innerHTML        = rate;
+                document.getElementById('stat-media-sent').textContent = data.media_sent_today || 0;
+                var availability = data.media_availability || {};
+                document.getElementById('stat-media-unlogged').textContent = _formatAvailability(availability.unlogged);
+                document.getElementById('stat-media-base').textContent = _formatAvailability(availability.base);
+                document.getElementById('stat-media-paid').textContent = _formatAvailability(availability.paid);
 
                 var rt = data.response_time || {};
                 var globalAvg = rt.global_avg_ms;
@@ -697,6 +719,10 @@
                 document.getElementById('stat-requests').textContent = '&mdash;';
                 document.getElementById('stat-responses').textContent = '&mdash;';
                 document.getElementById('stat-errors').textContent = '&mdash;';
+                document.getElementById('stat-media-sent').textContent = '&mdash;';
+                document.getElementById('stat-media-unlogged').textContent = '&mdash;';
+                document.getElementById('stat-media-base').textContent = '&mdash;';
+                document.getElementById('stat-media-paid').textContent = '&mdash;';
                 document.getElementById('stat-rate').textContent = '&mdash;';
                 document.getElementById('stat-avg-ms').textContent = '&mdash;';
                 document.getElementById('stat-per-engine-ms').innerHTML = '&mdash;';
@@ -709,17 +735,86 @@
         // ----------------------------------------------------------------
         // Prompt
         // ----------------------------------------------------------------
+        function _formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+            return Math.round((bytes / (1024 * 1024)) * 10) / 10 + ' MB';
+        }
+
+        function _renderMediaList() {
+            var input = document.getElementById('media-input');
+            var list = document.getElementById('media-list');
+            if (!input || !list) return;
+            var files = input.files ? Array.from(input.files) : [];
+            if (!files.length) {
+                list.textContent = 'No media selected.';
+                return;
+            }
+            list.innerHTML = files.map(function(file) {
+                var kind = file.type.startsWith('image/') ? 'Image' : file.type.startsWith('audio/') ? 'Audio' : 'File';
+                return '<div>' + escapeHtml(file.name) + ' (' + kind + ', ' + _formatFileSize(file.size) + ')</div>';
+            }).join('');
+        }
+
+        function _fileToDataUrl(file) {
+            return new Promise(function(resolve, reject) {
+                var reader = new FileReader();
+                reader.onload = function() { resolve(reader.result); };
+                reader.onerror = function() { reject(new Error('Failed to read ' + file.name)); };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        async function _buildMediaParts() {
+            var input = document.getElementById('media-input');
+            if (!input || !input.files || !input.files.length) return [];
+            var files = Array.from(input.files);
+            var parts = [];
+            for (var i = 0; i < files.length; i++) {
+                var file = files[i];
+                var dataUrl = await _fileToDataUrl(file);
+                if (file.type.startsWith('image/')) {
+                    parts.push({
+                        type: 'image_url',
+                        url: dataUrl,
+                        filename: file.name,
+                    });
+                } else if (file.type.startsWith('audio/')) {
+                    parts.push({
+                        type: 'input_audio',
+                        data: dataUrl,
+                        mime_type: file.type || 'audio/mpeg',
+                        filename: file.name,
+                    });
+                }
+            }
+            return parts;
+        }
+
         async function sendPrompt() {
             var engine = document.getElementById('engine-select').value;
             if (!engine) { alert('Select an engine first.'); return; }
             var prompt = document.getElementById('prompt-input').value;
-            var box    = document.getElementById('response-box');
+            var box = document.getElementById('response-box');
             box.textContent = 'Waiting\u2026';
             try {
+                var mediaParts = await _buildMediaParts();
+                var content = [{ type: 'text', content: prompt || '' }];
+                if (mediaParts.length) {
+                    content = content.concat(mediaParts);
+                }
+                var payload = {
+                    messages: [
+                        {
+                            role: 'user',
+                            content: content,
+                        },
+                    ],
+                };
                 var res = await fetchJson('/engine/' + engine + '/prompt', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: prompt }),
+                    body: JSON.stringify(payload),
                 });
                 box.textContent = JSON.stringify(res, null, 2);
             } catch (err) {

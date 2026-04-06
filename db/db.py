@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import threading
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -129,6 +130,28 @@ def inc_responses() -> None:
 
 def inc_errors() -> None:
     _inc_stat("errors", 1)
+
+
+def _today_media_key() -> str:
+    return f"media_sent:{date.today().isoformat()}"
+
+
+def inc_media_sent(amount: int = 1) -> None:
+    if amount <= 0:
+        return
+    _inc_stat(_today_media_key(), amount)
+
+
+def get_media_sent_today() -> int:
+    with DB_LOCK:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM stats WHERE key = ?", (_today_media_key(),))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
 
 
 def get_stats() -> Dict[str, int]:

@@ -31,10 +31,10 @@ import importlib.util
 import inspect
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from core.selenium_llm_base import SeleniumLLMBase
@@ -69,6 +69,8 @@ class EngineDescriptor:
     # (default).  Values > 1 are reserved for future parallel-session support;
     # the queue infrastructure already handles them correctly.
     max_workers: int = 1
+    media_capabilities: list[str] = field(default_factory=list)
+    media_support: dict[str, Any] = field(default_factory=dict)
 
     def limits_dict(self) -> dict:
         """Return interface-limits metadata without starting a browser."""
@@ -95,6 +97,9 @@ class EngineDescriptor:
         }
         if self.notes:
             data["notes"] = self.notes
+        if self.media_support:
+            data["media_support"] = self.media_support
+        data["media_capabilities"] = list(self.media_capabilities)
         return data
 
 
@@ -103,14 +108,40 @@ class EngineDescriptor:
 # ---------------------------------------------------------------------------
 
 
+def _supports_media_capability(cfg_item: Any) -> bool:
+    if not isinstance(cfg_item, dict):
+        return False
+
+    limits = cfg_item.get("limits")
+    if isinstance(limits, dict):
+        for value in limits.values():
+            if value == -1:
+                return True
+            if isinstance(value, int) and value > 0:
+                return True
+
+    supported_models = cfg_item.get("supported_models")
+    if isinstance(supported_models, list) and len(supported_models) > 0:
+        return True
+
+    return False
+
+
 def _scan_json(path: Path) -> Optional[EngineDescriptor]:
     try:
         with path.open(encoding="utf-8") as fh:
             cfg = json.load(fh)
         name = cfg.get("name")
+        media_support = cfg.get("media_support", {}) or {}
         if not name:
             logger.warning(f"[engine_manager] JSON engine without 'name': {path}")
             return None
+        media_support = cfg.get("media_support", {}) or {}
+        capabilities = [
+            key
+            for key in ("image", "audio", "document")
+            if key in media_support and _supports_media_capability(media_support[key])
+        ]
         return EngineDescriptor(
             name=name,
             aliases=list(cfg.get("aliases", [name])),
@@ -123,6 +154,8 @@ def _scan_json(path: Path) -> Optional[EngineDescriptor]:
             max_workers=int(cfg.get("max_workers", 1)),
             source="json",
             source_path=str(path),
+            media_capabilities=capabilities,
+            media_support=media_support,
         )
     except Exception as exc:
         logger.warning(f"[engine_manager] Failed to scan JSON engine {path}: {exc}")
@@ -268,6 +301,7 @@ class _PromptJob:
 
     prompt: str
     future: asyncio.Future  # type: ignore[type-arg]
+    media: list[Any] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +465,10 @@ class EngineManager:
             try:
                 engine = self.get_engine(engine_name)  # lazy-init browser here
                 self.active_engine = engine
-                result_text = await engine.generate_response(job.prompt)
+                try:
+                    result_text = await engine.generate_response(job.prompt, job.media)
+                except TypeError:
+                    result_text = await engine.generate_response(job.prompt)
                 model_name = engine.get_current_model()
                 if not job.future.done():
                     job.future.set_result(_PromptResult(text=result_text, model_name=model_name))
@@ -445,8 +482,13 @@ class EngineManager:
             finally:
                 queue.task_done()
 
-    async def enqueue(self, engine_name: str, prompt: str) -> _PromptResult:
-        """Submit *prompt* to the named engine's FIFO queue and await the result.
+    async def enqueue(
+        self,
+        engine_name: str,
+        prompt: str,
+        media: list[Any] | None = None,
+    ) -> _PromptResult:
+        """Submit *prompt* and optional media to the named engine's FIFO queue.
 
         The engine browser is started lazily by the worker, not by the HTTP
         handler.  Concurrent callers on the same engine are serialised
@@ -456,7 +498,7 @@ class EngineManager:
         queue = self._get_or_create_queue(canonical)
         loop = asyncio.get_event_loop()
         future: asyncio.Future[_PromptResult] = loop.create_future()
-        job = _PromptJob(prompt=prompt, future=future)
+        job = _PromptJob(prompt=prompt, future=future, media=media or [])
         self._ensure_workers(canonical)
         await queue.put(job)
         return await future

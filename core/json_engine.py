@@ -116,15 +116,26 @@ class JsonEngine(SeleniumLLMBase):
             self.prompt_area_selectors = list(sel["prompt_area"])
         if "send_button" in sel:
             self.send_button_selectors = list(sel["send_button"])
+        if "accept_button" in sel:
+            self.accept_button_selectors = list(sel["accept_button"])
         if "response_area" in sel:
             self.response_area_selectors = list(sel["response_area"])
         if "stop" in sel:
             self.stop_selectors = list(sel["stop"])
+        if "limit" in sel:
+            self.limit_selectors = list(sel["limit"])
         if "send_button_blacklist" in sel:
             self.send_button_blacklist = list(sel["send_button_blacklist"])
+        self.base_account_selector = sel.get("base_account_selector")
 
         # ------------------------------------------------------------------ login rules
         self._login_cfg: dict[str, Any] = config.get("login_detection", {})
+
+        # ------------------------------------------------------------------ media support
+        self.media_config: dict[str, Any] = config.get("media_support", {})
+        self.paid_account_selector = self.media_config.get("paid_account_selector")
+        if self.base_account_selector is None:
+            self.base_account_selector = self.media_config.get("base_account_selector")
 
     # ---------------------------------------------------------------------- login
 
@@ -142,11 +153,22 @@ class JsonEngine(SeleniumLLMBase):
         """
         cfg = self._login_cfg
         try:
-            url_prefix: str = cfg.get("url_prefix", self.service_url)
-            if url_prefix and not driver.current_url.startswith(url_prefix):
-                driver.get(url_prefix)
+            current_url = (driver.current_url or "").lower()
 
-            current_url = driver.current_url.lower()
+            # Step 0 — authenticated element present on the current page
+            auth_selectors: list[str] = cfg.get("authenticated_css_selectors", [])
+            for css in auth_selectors:
+                try:
+                    els = driver.find_elements(By.CSS_SELECTOR, css)
+                    if els and any(_safe_displayed(e) for e in els):
+                        return True
+                except Exception:
+                    pass
+
+            url_prefix: str = cfg.get("url_prefix", self.service_url)
+            if url_prefix and not current_url.startswith(url_prefix):
+                driver.get(url_prefix)
+                current_url = (driver.current_url or "").lower()
 
             # Step 2 — deny keywords in URL
             deny_keywords: list[str] = cfg.get("url_deny_keywords", [])
@@ -163,8 +185,7 @@ class JsonEngine(SeleniumLLMBase):
                 except Exception:
                     pass
 
-            # Step 4 — authenticated element present
-            auth_selectors: list[str] = cfg.get("authenticated_css_selectors", [])
+            # Step 4 — authenticated element present after navigation
             for css in auth_selectors:
                 try:
                     els = driver.find_elements(By.CSS_SELECTOR, css)

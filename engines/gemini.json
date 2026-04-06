@@ -32,6 +32,7 @@
       "button[aria-label*='Send']",
       "button[type='submit']"
     ],
+    "base_account_selector": "#app-root > main > top-bar-actions > div > div.right-section > div.buttons-container.adv-upsell.ng-star-inserted > g1-dynamic-upsell-button",
     "response_area": [
       "model-response .markdown",
       "model-response",
@@ -41,6 +42,9 @@
       ".message-content",
       "div[class*='response-text']"
     ],
+    "accept_button": [
+      "button[data-test-id='upload-image-agree-button']"
+    ],
     "stop": [
       "button[aria-label='Stop response']",
       "button[aria-label='Cancel']",
@@ -48,6 +52,17 @@
       ".stop-button",
       "[data-testid='stop-button']"
     ]
+  },
+  "media_support": {
+    "image": {
+      "limits": {"unlogged": 0, "base": 3, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"]
+    }
   },
   "login_detection": {
     "url_prefix": "https://gemini.google.com",

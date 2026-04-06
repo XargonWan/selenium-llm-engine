@@ -50,12 +50,24 @@
       "div.h-10.aspect-square:has(svg[width='16'])"
     ]
   },
+  "media_support": {
+    "image": {
+      "limits": {"unlogged": 0, "base": 3, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": []
+    }
+  },
   "login_detection": {
-    "url_prefix": "https://accounts.x.ai/sign-in?redirect=grok-com",
+    "url_prefix": "https://grok.com/c",
     "url_deny_keywords": ["signin", "login", "auth"],
     "login_button_xpath": "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in') or contains(@href, 'sign-in') or @data-slot='button']",
     "authenticated_css_selectors": [
-      "textarea[aria-label='Ask Grok anything']",
+      "textarea[aria-label*='Ask Grok']",
+      "div[role='textbox'][contenteditable='true']",
       "div.message-bubble"
     ]
   }

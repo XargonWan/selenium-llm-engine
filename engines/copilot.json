@@ -4,7 +4,7 @@
   "aliases": ["copilot", "microsoft"],
   "service_url": "https://copilot.microsoft.com/",
   "notes": "Might work even unlogged but is very unstable, hence the unlogged mode is disabled.",
-  "default_model": "unlogged",
+  "default_model": "default",
   "allow_unlogged": false,
   "models": {
     "unlogged": 28000,
@@ -16,6 +16,9 @@
       "textarea[placeholder*='Ask']",
       "div[contenteditable='true']",
       "textarea"
+    ],
+    "accept_button": [
+      "#app > div.flex.h-full.overflow-hidden.bg-sidebar-light.dark\\:bg-sidebar-dark > main > div.relative.size-full.overflow-hidden > div.relative.size-full.overflow-hidden.md\\:rounded-container > div.pointer-events-none.absolute.bottom-0.w-full.sm\\:bottom-1\\/2.sm\\:translate-y-1\\/2.sm\\:pt-36 > div > div > div > div.relative.max-h-full.min-h-composer.min-w-16.max-w-chat.rounded-5xl > div.relative.shadow-tinted-xl.backdrop-blur-2xl.backdrop-saturate-200.bg-accent-100\\/60.dark\\:bg-muted-200\\/50 > div > div.w-prompt-sign-in > div > div > dialog > div > div.flex.size-full.flex-col.gap-4.p-0.text-left > div > button:nth-child(1)"
     ],
     "send_button": [
       "#app > div.flex.h-full.overflow-hidden.bg-sidebar-light.dark\\:bg-sidebar-dark > main > div.relative.size-full.overflow-hidden > div.relative.size-full.overflow-hidden.md\\:rounded-container > div.pointer-events-none.absolute.bottom-0.w-full.sm\\:bottom-1\\/2.sm\\:translate-y-1\\/2.sm\\:pt-36 > div > div > div > div.relative.max-h-full.min-h-composer.min-w-16.max-w-chat.rounded-5xl > div.relative.shadow-tinted-xl.backdrop-blur-2xl.backdrop-saturate-200.bg-accent-100\\/60.dark\\:bg-muted-200\\/50 > div > div > div > div.relative.bottom-0.flex.justify-between.pb-0\\.5.pe-2\\.5.ps-1\\.5 > div:nth-child(2) > div > button",
@@ -36,6 +39,17 @@
       "button[aria-label*='Stop']",
       "button[data-testid='stop-button']"
     ]
+  },
+  "media_support": {
+    "image": {
+      "limits": {"unlogged": 0, "base": 3, "paid": -1},
+      "supported_models": ["all"],
+      "upload_selectors": ["input[type='file'][accept*='image']", "input[type='file']"]
+    },
+    "audio": {
+      "limits": {"unlogged": 0, "base": -1, "paid": -1},
+      "supported_models": ["all"]
+    }
   },
   "login_detection": {
     "url_prefix": "https://copilot.microsoft.com/login",
