@@ -1,7 +1,7 @@
 ARG TARGETPLATFORM
 FROM ghcr.io/astral-sh/uv:latest AS uv_source
 
-FROM --platform=$TARGETPLATFORM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
+FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
 
 # --- Webtop / Selenium environment setup ---
 ENV TITLE="Selenium LLM Engine"
