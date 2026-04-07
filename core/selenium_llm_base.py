@@ -1284,6 +1284,46 @@ class SeleniumLLMBase:
 
     # ------------------------------------------------------------------ helpers
 
+    def _get_response_text_js(self, driver: Any) -> str:
+        """Return fallback response text using JavaScript when CSS selectors fail."""
+        try:
+            script = """
+            const selectors = [
+                '.assistant-message',
+                '.assistant',
+                '.gemini-response',
+                'message-content .markdown-main-panel',
+                '.markdown-main-panel',
+                'model-response .markdown',
+                'model-response',
+                '.model-response',
+                '.response-container',
+                '.presented-response-container',
+                '.structured-content-container',
+                '.markdown',
+                'message-content',
+                '.message-content',
+                'div[role="article"]',
+                'article'
+            ];
+            for (const sel of selectors) {
+                const els = Array.from(document.querySelectorAll(sel));
+                if (els.length) {
+                    const el = els[els.length - 1];
+                    if (el && el.textContent && el.textContent.trim()) {
+                        return el.textContent.trim();
+                    }
+                }
+            }
+            return '';
+            """
+            result = driver.execute_script(script)
+            if isinstance(result, str):
+                return result.strip()
+        except Exception:
+            pass
+        return ""
+
     def _get_latest_response_text(self, driver: Any) -> str:
         """Return latest non-empty text from response selectors, or empty if none."""
         for sel in self.response_area_selectors:
@@ -1295,7 +1335,8 @@ class SeleniumLLMBase:
                         return text
             except Exception:
                 pass
-        return ""
+
+        return self._get_response_text_js(driver)
 
     def _send_button_present(self, driver: Any) -> bool:
         """Return True if a send button is currently visible and enabled on the page.

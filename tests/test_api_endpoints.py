@@ -1651,6 +1651,8 @@ def test_post_send_check_returns_false_on_redirect():
 
 def test_get_latest_response_text_uses_first_matching_selector():
     """_get_latest_response_text should return text from the first selector that matches."""
+    import tempfile
+
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -1658,6 +1660,7 @@ def test_get_latest_response_text_uses_first_matching_selector():
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
     engine.response_area_selectors = ["div.assistant", "div.alternate"]
 
@@ -1676,6 +1679,28 @@ def test_get_latest_response_text_uses_first_matching_selector():
     result = engine._get_latest_response_text(mock_driver)
     assert result == "Hello from assistant"
 
+
+def test_get_latest_response_text_js_fallback_when_selectors_fail():
+    """_get_latest_response_text should fall back to JS extraction when CSS selectors return nothing."""
+    import tempfile
+
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.assistant", "div.alternate"]
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = []
+    mock_driver.execute_script.return_value = "JS fallback text"
+
+    result = engine._get_latest_response_text(mock_driver)
+    assert result == "JS fallback text"
 
 def test_sync_generate_response_retries_on_redirect_stall():
     """_sync_generate_response must retry once on redirect-stall without resetting the driver."""

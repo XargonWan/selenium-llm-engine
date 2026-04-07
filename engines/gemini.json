@@ -30,10 +30,14 @@
       "button[aria-label*='Send message']",
       "button[data-testid='send-button']",
       "button[aria-label*='Send']",
+      "button[aria-label*='Send reply']",
       "button[type='submit']"
     ],
     "base_account_selector": "#app-root > main > top-bar-actions > div > div.right-section > div.buttons-container.adv-upsell.ng-star-inserted > g1-dynamic-upsell-button",
     "response_area": [
+      ".assistant-message",
+      ".assistant",
+      ".gemini-response",
       "model-response .markdown-main-panel",
       "message-content .markdown-main-panel",
       ".markdown-main-panel",
@@ -46,7 +50,9 @@
       ".response-container",
       "message-content",
       ".message-content",
-      "div[class*='response-text']"
+      "div[class*='response-text']",
+      "div[role='article']",
+      "article"
     ],
     "accept_button": [
       "upload-image-disclaimer-dialog button[data-test-id='upload-image-agree-button']",
@@ -54,8 +60,13 @@
     ],
     "stop": [
       "button[aria-label='Stop response']",
+      "button[aria-label='Stop generating']",
+      "button[aria-label='Cancel response']",
+      "button[aria-label='Cancel generation']",
       "button[aria-label='Cancel']",
       "button[aria-label*='Stop']",
+      "button[title*='Stop']",
+      "button[title*='Cancel']",
       ".stop-button",
       "[data-testid='stop-button']",
       "mat-icon[fonticon='stop']",
