@@ -1,6 +1,7 @@
 import asyncio
 import glob
 import logging
+import json
 import math
 import mimetypes
 import os
@@ -99,6 +100,25 @@ class SeleniumLLMBase:
         # Prompt chunking: split prompts that exceed the model char limit
         self._split_prompt_parts: int = max(1, int(os.getenv("SELENIUM_SPLIT_PROMPT_PARTS", "3")))
         self._skip_split_for_next: bool = False
+
+        # Per-engine response timeout override (seconds).  Set by JsonEngine from the
+        # JSON config key "response_max_wait".  None means use the built-in default.
+        self._response_max_wait: int | None = None
+
+        # Set to True when _wait_for_response observes the stop-button during the
+        # last generation attempt.  Used by _sync_generate_response to decide whether
+        # to reset the driver on a detection-timeout: if the model was actively
+        # generating (slow thinking model) we skip the reset; if the stop-button was
+        # never seen (stuck/dead session) we reset as before.
+        self._generation_was_active: bool = False
+
+        # If the uc.Chrome session dies after initialization, prefer the
+        # standard webdriver.Chrome fallback on the next driver init attempt.
+        self._prefer_webdriver_fallback: bool = False
+
+        # Some engines (Gemini) work more reliably when response detection uses
+        # stable text instead of comparing against prior baseline text.
+        self._use_baseline_comparison: bool = True
 
     def get_supported_models(self) -> list[str]:
         return list(self.model_limits_map.keys())
@@ -272,6 +292,9 @@ class SeleniumLLMBase:
                 options = self._build_options()
                 options.binary_location = chromium_binary
                 try:
+                    if self._prefer_webdriver_fallback:
+                        raise RuntimeError("Skipping uc.Chrome because webdriver fallback is preferred")
+
                     logger.info(
                         f"[selenium] Driver initialization attempt {attempt + 1}/{max_retries}"
                     )
@@ -311,9 +334,14 @@ class SeleniumLLMBase:
 
             if self.driver is None:
                 # Fallback: standard webdriver (no anti-detection patching)
-                logger.warning(
-                    "[selenium] uc.Chrome failed after all retries, trying webdriver.Chrome fallback"
-                )
+                if self._prefer_webdriver_fallback:
+                    logger.info(
+                        "[selenium] Using webdriver.Chrome fallback due to prior uc.Chrome instability"
+                    )
+                else:
+                    logger.warning(
+                        "[selenium] uc.Chrome failed after all retries, trying webdriver.Chrome fallback"
+                    )
                 try:
                     fallback_options = self._build_options()
                     fallback_options.binary_location = chromium_binary
@@ -725,9 +753,16 @@ class SeleniumLLMBase:
             except RuntimeError as e:
                 if attempt == 0:
                     if self._is_dead_session(e):
-                        logger.warning(
-                            f"[selenium] Dead session on attempt {attempt + 1}, resetting and retrying…"
-                        )
+                        if not getattr(self, "_prefer_webdriver_fallback", False):
+                            logger.warning(
+                                "[selenium] Dead session on attempt %s, forcing webdriver.Chrome fallback on next init",
+                                attempt + 1,
+                            )
+                            self._prefer_webdriver_fallback = True
+                        else:
+                            logger.warning(
+                                f"[selenium] Dead session on attempt {attempt + 1}, resetting and retrying…"
+                            )
                         self._reset_driver()
                         continue
                     if self._is_redirect_stall(e):
@@ -736,11 +771,20 @@ class SeleniumLLMBase:
                         )
                         continue
                     if self._is_response_detection_timeout(e):
-                        logger.warning(
-                            f"[selenium] Response detection timeout on attempt {attempt + 1}, "
-                            "resetting driver and retrying…"
-                        )
-                        self._reset_driver()
+                        if getattr(self, "_generation_was_active", False):
+                            # The model was visibly generating (stop-button seen) but
+                            # didn't finish within max_wait.  Don't reset the driver —
+                            # it would kill the active session.  Just retry as-is.
+                            logger.warning(
+                                f"[selenium] Response detection timeout on attempt {attempt + 1} "
+                                "(model was actively generating — slow/thinking model, skipping driver reset)"
+                            )
+                        else:
+                            logger.warning(
+                                f"[selenium] Response detection timeout on attempt {attempt + 1}, "
+                                "resetting driver and retrying…"
+                            )
+                            self._reset_driver()
                         continue
                 raise
         # Should not be reached, but satisfy mypy
@@ -1284,6 +1328,55 @@ class SeleniumLLMBase:
 
     # ------------------------------------------------------------------ helpers
 
+    def _looks_like_response_text_junk(self, text: str) -> bool:
+        """Return True for text that appears to be page state JSON rather than chat output."""
+        if not text:
+            return True
+
+        stripped = text.strip()
+        if len(stripped) > 300:
+            return False
+
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                json.loads(stripped)
+                logger.debug(
+                    "[selenium] _looks_like_response_text_junk: rejected JSON-like text"
+                )
+                return True
+            except Exception:
+                pass
+
+        if stripped.startswith("Gemini said"):
+            after = stripped[len("Gemini said"):].strip()
+            if not after:
+                logger.debug(
+                    "[selenium] _looks_like_response_text_junk: rejected bare Gemini said prefix"
+                )
+                return True
+            if after.startswith("{") or after.startswith("["):
+                try:
+                    json.loads(after)
+                    logger.debug(
+                        "[selenium] _looks_like_response_text_junk: rejected Gemini state dump"
+                    )
+                    return True
+                except Exception:
+                    pass
+            if "\"memory_search\"" in after or "\"recovery_actions\"" in after:
+                logger.debug(
+                    "[selenium] _looks_like_response_text_junk: rejected Gemini state prefix"
+                )
+                return True
+
+        if "\"memory_search\"" in stripped or "\"recovery_actions\"" in stripped:
+            logger.debug(
+                "[selenium] _looks_like_response_text_junk: rejected memory/search state text"
+            )
+            return True
+
+        return False
+
     def _get_response_text_js(self, driver: Any) -> str:
         """Return fallback response text using JavaScript when CSS selectors fail."""
         try:
@@ -1308,8 +1401,8 @@ class SeleniumLLMBase:
             ];
             for (const sel of selectors) {
                 const els = Array.from(document.querySelectorAll(sel));
-                if (els.length) {
-                    const el = els[els.length - 1];
+                for (let i = els.length - 1; i >= 0; i--) {
+                    const el = els[i];
                     if (el && el.textContent && el.textContent.trim()) {
                         return el.textContent.trim();
                     }
@@ -1319,22 +1412,64 @@ class SeleniumLLMBase:
             """
             result = driver.execute_script(script)
             if isinstance(result, str):
-                return result.strip()
+                result = result.strip()
+                if not self._looks_like_response_text_junk(result):
+                    return result
         except Exception:
             pass
         return ""
 
     def _get_latest_response_text(self, driver: Any) -> str:
         """Return latest non-empty text from response selectors, or empty if none."""
+        candidates: list[str] = []
         for sel in self.response_area_selectors:
             try:
                 els = driver.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    text = els[-1].text.strip()
-                    if text:
+                if not els:
+                    continue
+
+                for elem in reversed(els):
+                    text = elem.text.strip()
+                    tc = ""
+                    try:
+                        tc = (elem.get_attribute("textContent") or "").strip()
+                    except Exception:
+                        pass
+
+                    if tc and self._looks_like_response_text_junk(tc):
+                        logger.debug(
+                            "[selenium] _get_latest_response_text: selector=%s text=%r tc=%r rejected as junk",
+                            sel,
+                            text[:120],
+                            tc[:120],
+                        )
+                        continue
+
+                    if text and not self._looks_like_response_text_junk(text):
+                        logger.debug(
+                            "[selenium] _get_latest_response_text: selector=%s returned visible text=%r",
+                            sel,
+                            text[:120],
+                        )
                         return text
+                    if tc and not self._looks_like_response_text_junk(tc):
+                        logger.debug(
+                            "[selenium] _get_latest_response_text: selector=%s used textContent fallback=%r",
+                            sel,
+                            tc[:120],
+                        )
+                        return tc
+
+                    if text:
+                        candidates.append(text)
+                    if tc and tc != text:
+                        candidates.append(tc)
             except Exception:
                 pass
+
+        for candidate in candidates:
+            if not self._looks_like_response_text_junk(candidate):
+                return candidate
 
         return self._get_response_text_js(driver)
 
@@ -1354,6 +1489,16 @@ class SeleniumLLMBase:
                             return True
                     except Exception:
                         pass
+            except Exception:
+                pass
+        return False
+
+    def _response_area_present(self, driver: Any) -> bool:
+        """Return True if any configured response selector exists in the DOM."""
+        for sel in self.response_area_selectors:
+            try:
+                if driver.find_elements(By.CSS_SELECTOR, sel):
+                    return True
             except Exception:
                 pass
         return False
@@ -1730,8 +1875,14 @@ class SeleniumLLMBase:
                 logger.warning("[selenium] post_send_check: redirect detected — returning False")
                 return False
             if not self._send_button_present(driver):
-                logger.debug("[selenium] post_send_check fallback: send button absent — generation in progress")
-                return True
+                if self._response_area_present(driver):
+                    logger.debug(
+                        "[selenium] post_send_check fallback: send button absent and response area detected — generation in progress"
+                    )
+                    return True
+                logger.debug(
+                    "[selenium] post_send_check fallback: send button absent but no response area detected yet"
+                )
             time.sleep(0.2)
 
         # Timeout expired — check if we are still on the expected page
@@ -1759,7 +1910,16 @@ class SeleniumLLMBase:
         3. Poll until the response is stable (1 s) and stop button disappears.
         """
         self._click_accept_buttons(driver, timeout=2.0)
-        baseline = self._get_latest_response_text(driver)
+        baseline = ""
+        if self._use_baseline_comparison:
+            baseline = self._get_latest_response_text(driver)
+            logger.debug("[selenium] Baseline text length: %d", len(baseline))
+        else:
+            logger.debug("[selenium] Skipping baseline comparison for this engine")
+
+        # Reset per-attempt generation tracker before Phase 1 so that any signal
+        # detected during Phase 1 is preserved into Phase 2.
+        self._generation_was_active = False
 
         initial_timeout = float(os.getenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "60"))
         start = time.time()
@@ -1788,6 +1948,7 @@ class SeleniumLLMBase:
             # Fallback: if the send button disappeared the LLM accepted the prompt
             if not self._send_button_present(driver):
                 logger.debug("[selenium] Generation started (send button absent) — fallback signal")
+                self._generation_was_active = True  # prompt accepted; never reset driver on timeout
                 _initial_new_text_found = True
                 break
             time.sleep(poll_interval)
@@ -1797,16 +1958,24 @@ class SeleniumLLMBase:
                 f"[selenium] Response area did not produce new text within {initial_timeout}s"
             )
 
-        max_wait = int(os.getenv("SELENIUM_RESPONSE_MAX_WAIT", str(max_wait)))
+        # Resolution order: per-engine override → env var → built-in default.
+        _engine_max_wait = getattr(self, "_response_max_wait", None)
+        effective_max_wait = int(_engine_max_wait) if _engine_max_wait else max_wait
+        max_wait = int(os.getenv("SELENIUM_RESPONSE_MAX_WAIT", str(effective_max_wait)))
 
         start = time.time()
+        # Inactivity-based timeout: last_activity is reset whenever the LLM shows
+        # any sign of life (stop-button visible, send-button absent, or text changes).
+        # max_wait = inactivity cap; max_wait * 3 = absolute safety-cap.
+        last_activity = time.time()
         first_new = ""
         stable_since = time.time()
+        _last_status_log: float = time.time()
         # Fallback trackers: text-stability + send-button presence
         _fb_last_text: str = ""
         _fb_stable_since: float = time.time()
 
-        while time.time() - start < max_wait:
+        while time.time() - last_activity < max_wait and time.time() - start < max_wait * 3:
             generating = False
             for sel in self.stop_selectors:
                 try:
@@ -1826,10 +1995,60 @@ class SeleniumLLMBase:
                         raise
 
             if generating:
+                self._generation_was_active = True
+                last_activity = time.time()
                 time.sleep(0.3)
                 stable_since = time.time()
                 _fb_stable_since = time.time()  # reset fallback timer while generating
                 continue
+
+            # Check for silent processing: model received prompt but stop-button is
+            # hidden (e.g. Gemini 2.5 Flash thinking-mode hides the stop button
+            # while reasoning, before emitting any text).
+            # NOTE: we do NOT update last_activity here — we only mark
+            # _generation_was_active=True (prevents driver reset on timeout)
+            # and reset stable_since when mid-stream to prevent premature return.
+            # The inactivity timer must tick naturally so stuck sessions time out
+            # at max_wait rather than running to the max_wait*3 absolute cap.
+            if self.send_button_selectors:
+                try:
+                    if not self._send_button_present(driver):
+                        self._generation_was_active = True
+                        if first_new:
+                            # Model paused mid-stream: prevent premature stability
+                            # return but let inactivity timer work.
+                            stable_since = time.time()
+                except Exception as _st_e:
+                    if self._is_dead_session(_st_e):
+                        raise
+
+            # Detect page-level error conditions (rate limit, captcha) so we
+            # can fail fast instead of spinning until the absolute cap.
+            if self._is_limit_present(driver):
+                raise RuntimeError(
+                    "selenium_response_detection_timeout: service limit detected "
+                    "during response wait (quota/rate-limit page shown)"
+                )
+            if self._is_captcha_present(driver):
+                raise RuntimeError(
+                    "selenium_response_detection_timeout: CAPTCHA detected "
+                    "during response wait"
+                )
+
+            # Periodic Phase 2 status log (every 30 s).
+            if time.time() - _last_status_log >= 30.0:
+                _elapsed = time.time() - start
+                _inactivity = time.time() - last_activity
+                cur_snippet = self._get_latest_response_text(driver)
+                logger.info(
+                    "[selenium] Phase 2 status: elapsed=%.1fs inactivity=%.1fs "
+                    "first_new_len=%d generating=%s gen_was_active=%s "
+                    "baseline_snippet=%r cur_snippet=%r",
+                    _elapsed, _inactivity, len(first_new), generating,
+                    self._generation_was_active,
+                    (baseline or "")[:80], (cur_snippet or "")[:80],
+                )
+                _last_status_log = time.time()
 
             cur = self._get_latest_response_text(driver)
             cur_url = ""
@@ -1839,6 +2058,7 @@ class SeleniumLLMBase:
                 pass
 
             if cur and cur != baseline:
+                last_activity = time.time()
                 if first_new == "" or cur != first_new:
                     first_new = cur
                     stable_since = time.time()
@@ -1850,21 +2070,21 @@ class SeleniumLLMBase:
                     )
                     return first_new
 
-                if time.time() - stable_since >= 0.5:
-                    logger.debug("[selenium] Response stable — done")
+                if time.time() - stable_since >= 1.5:
+                    logger.debug("[selenium] Response stable (1.5 s) — done")
                     return first_new
             elif first_new:
-                if time.time() - stable_since >= 0.5:
-                    logger.debug("[selenium] First new response stable — done")
+                if time.time() - stable_since >= 1.5:
+                    logger.debug("[selenium] First new response stable (1.5 s) — done")
                     return first_new
 
             # Fallback: text-stability only.
-            # When the response text has not changed for 1 s and is different
+            # When the response text has not changed for 2 s and is different
             # from baseline, the LLM has finished generating.
             if cur != _fb_last_text:
                 _fb_last_text = cur
                 _fb_stable_since = time.time()
-            elif time.time() - _fb_stable_since >= 1.0:
+            elif time.time() - _fb_stable_since >= 2.0:
                 result = cur if (cur and cur != baseline) else first_new
                 if result:
                     logger.debug("[selenium] Fallback: text stable 1 s — done")

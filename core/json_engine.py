@@ -131,6 +131,16 @@ class JsonEngine(SeleniumLLMBase):
         # ------------------------------------------------------------------ login rules
         self._login_cfg: dict[str, Any] = config.get("login_detection", {})
 
+        # ------------------------------------------------------------------ response timing
+        # Optional JSON key "response_max_wait" (seconds) overrides the built-in
+        # 120-second stability-loop timeout in _wait_for_response.
+        # Useful for slow/thinking models (e.g. Gemini 2.5 Flash) that can take
+        # several minutes to produce a full response.
+        if "response_max_wait" in config:
+            self._response_max_wait = int(config["response_max_wait"])
+        if "use_baseline_comparison" in config:
+            self._use_baseline_comparison = bool(config["use_baseline_comparison"])
+
         # ------------------------------------------------------------------ media support
         self.media_config: dict[str, Any] = config.get("media_support", {})
         self.paid_account_selector = self.media_config.get("paid_account_selector")

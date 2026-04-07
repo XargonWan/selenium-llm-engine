@@ -1680,6 +1680,36 @@ def test_get_latest_response_text_uses_first_matching_selector():
     assert result == "Hello from assistant"
 
 
+def test_get_latest_response_text_checks_prior_elements_when_last_is_empty():
+    """_get_latest_response_text should use an earlier matching element when the last one is blank."""
+    import tempfile
+
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.assistant"]
+
+    empty_elem = MagicMock()
+    empty_elem.text = ""
+    empty_elem.get_attribute.return_value = ""
+
+    filled_elem = MagicMock()
+    filled_elem.text = "OK"
+    filled_elem.get_attribute.return_value = "OK"
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = [filled_elem, empty_elem]
+
+    result = engine._get_latest_response_text(mock_driver)
+    assert result == "OK"
+
+
 def test_get_latest_response_text_js_fallback_when_selectors_fail():
     """_get_latest_response_text should fall back to JS extraction when CSS selectors return nothing."""
     import tempfile
@@ -2255,6 +2285,37 @@ def test_post_send_check_fallback_when_send_button_absent():
     result = engine._post_send_check(mock_driver, timeout=1.0)
     # Send button absent → generation in progress → True
     assert result is True
+
+
+def test_post_send_check_fallback_requires_response_area():
+    """_post_send_check must recognize generation only when the response area exists."""
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.stop_selectors = []
+    engine.send_button_selectors = ["button.send"]
+    engine.response_area_selectors = [".response"]
+
+    def find_elements(by, selector):
+        if selector == "button.send":
+            return []
+        if selector == ".response":
+            return [MagicMock()]
+        return []
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.side_effect = find_elements
+    mock_driver.current_url = "https://example.com"
+
+    assert engine._post_send_check(mock_driver, timeout=0.5) is True
 
 
 def test_wait_for_response_initial_phase_fallback_send_button_absent():

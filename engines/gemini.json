@@ -4,6 +4,8 @@
   "aliases": ["gemini", "google"],
   "service_url": "https://gemini.google.com",
   "default_model": "2.5-flash",
+  "response_max_wait": 300,
+  "use_baseline_comparison": false,
   "allow_unlogged": true,
   "models": {
     "2.5-flash": 32000,
