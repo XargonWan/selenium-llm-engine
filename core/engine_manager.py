@@ -462,6 +462,13 @@ class EngineManager:
         queue = self._get_or_create_queue(engine_name)
         while True:
             job = await queue.get()
+            queued_at = getattr(job, "_queued_at", None)
+            worker_start = __import__("time").time()
+            if queued_at is not None:
+                logger.info(
+                    f"[timing] queue_wait ({engine_name}): "
+                    f"{worker_start - queued_at:.2f}s"
+                )
             try:
                 engine = self.get_engine(engine_name)  # lazy-init browser here
                 self.active_engine = engine
@@ -470,6 +477,10 @@ class EngineManager:
                 except TypeError:
                     result_text = await engine.generate_response(job.prompt)
                 model_name = engine.get_current_model()
+                elapsed = __import__("time").time() - worker_start
+                logger.info(
+                    f"[timing] worker_total ({engine_name}): {elapsed:.2f}s"
+                )
                 if not job.future.done():
                     job.future.set_result(_PromptResult(text=result_text, model_name=model_name))
             except asyncio.CancelledError:
@@ -499,6 +510,7 @@ class EngineManager:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[_PromptResult] = loop.create_future()
         job = _PromptJob(prompt=prompt, future=future, media=media or [])
+        job._queued_at = __import__("time").time()  # type: ignore[attr-defined]
         self._ensure_workers(canonical)
         await queue.put(job)
         return await future

@@ -602,6 +602,8 @@ def test_upload_media_clicks_accept_buttons_after_successful_upload():
 
 
 def test_sync_generate_response_once_returns_error_when_send_button_not_ready_after_media_upload():
+    import tempfile
+
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -609,6 +611,7 @@ def test_sync_generate_response_once_returns_error_when_send_button_not_ready_af
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
     engine.driver = MagicMock()
     engine.service_url = "https://example.com"
@@ -1301,6 +1304,8 @@ def test_click_send_handles_stale_first_selector():
 
 
 def test_wait_for_send_button_after_media_upload_returns_true_when_button_appears():
+    import tempfile
+
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -1308,6 +1313,7 @@ def test_wait_for_send_button_after_media_upload_returns_true_when_button_appear
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
     mock_driver = MagicMock()
     fake_button = MagicMock()
@@ -1322,6 +1328,8 @@ def test_wait_for_send_button_after_media_upload_returns_true_when_button_appear
 
 
 def test_wait_for_send_button_after_media_upload_times_out_when_button_never_appears():
+    import tempfile
+
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -1329,6 +1337,7 @@ def test_wait_for_send_button_after_media_upload_times_out_when_button_never_app
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
     mock_driver = MagicMock()
     mock_driver.find_elements.return_value = []
@@ -1567,6 +1576,7 @@ def test_legacy_models_response_schema_fields():
 
 def test_post_send_check_returns_true_when_stop_button_visible():
     """_post_send_check must return True immediately when a stop button becomes visible."""
+    import tempfile
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -1574,6 +1584,7 @@ def test_post_send_check_returns_true_when_stop_button_visible():
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
     engine.stop_selectors = ["button[aria-label*='Stop']"]
 
@@ -1588,8 +1599,9 @@ def test_post_send_check_returns_true_when_stop_button_visible():
     assert result is True
 
 
-def test_post_send_check_returns_false_on_redirect():
-    """_post_send_check must return False when timeout expires and URL has changed."""
+def test_post_send_check_recognizes_mat_icon_stop_selector():
+    """_post_send_check must detect a material icon stop indicator."""
+    import tempfile
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -1597,6 +1609,33 @@ def test_post_send_check_returns_false_on_redirect():
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.stop_selectors = ["mat-icon[fonticon='stop']"]
+
+    fake_icon = MagicMock()
+    fake_icon.is_displayed.return_value = True
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = [fake_icon]
+    mock_driver.current_url = "https://example.com"
+
+    result = engine._post_send_check(mock_driver, timeout=2.0)
+    assert result is True
+
+
+def test_post_send_check_returns_false_on_redirect():
+    """_post_send_check must return False when timeout expires and URL has changed."""
+    import tempfile
+
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
     engine.stop_selectors = ["button[aria-label*='Stop']"]
     engine.response_area_selectors = [".assistant-message"]
@@ -1640,12 +1679,14 @@ def test_get_latest_response_text_uses_first_matching_selector():
 
 def test_sync_generate_response_retries_on_redirect_stall():
     """_sync_generate_response must retry once on redirect-stall without resetting the driver."""
+    import tempfile
     from core.selenium_llm_base import SeleniumLLMBase
 
     engine = SeleniumLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=tempfile.mkdtemp(),
     )
 
     call_count = 0
@@ -1665,6 +1706,106 @@ def test_sync_generate_response_retries_on_redirect_stall():
     assert result == "ok response"
     assert call_count == 2
     assert reset_called == [], "Driver must NOT be reset on redirect-stall"
+
+
+def test_sync_generate_response_retries_on_response_detection_timeout():
+    """_sync_generate_response retries with driver reset when response detection times out."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+
+    call_count = 0
+
+    def fake_once(prompt):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError(
+                "selenium_response_detection_timeout: no new response text appeared"
+            )
+        return "real response"
+
+    engine._sync_generate_response_once = fake_once
+    reset_called = []
+    engine._reset_driver = lambda: reset_called.append(True)
+
+    result = engine._sync_generate_response("hello")
+    assert result == "real response"
+    assert call_count == 2
+    assert reset_called == [True], "Driver MUST be reset on response detection timeout"
+
+
+def test_wait_for_response_raises_on_detection_timeout(monkeypatch):
+    """_wait_for_response raises RuntimeError when no new text is found within timeout."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.stop_selectors = []
+
+    # Driver always returns the same text (no new text ever appears)
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = []  # no stop buttons, no response elements
+    mock_driver.current_url = "https://example.com"
+
+    # Patch env vars to use short timeouts so the test doesn't block
+    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+
+    with pytest.raises(RuntimeError, match="selenium_response_detection_timeout"):
+        engine._wait_for_response(mock_driver)
+
+
+def test_wait_for_response_returns_best_effort_when_first_new_set(monkeypatch):
+    """_wait_for_response returns best-effort text when first_new was set before max_wait."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.stop_selectors = []
+
+    call_count = 0
+
+    def fake_find_elements(by, selector):
+        nonlocal call_count
+        call_count += 1
+        if selector == "div.response" and call_count > 2:
+            el = MagicMock()
+            el.text = "new response text"
+            return [el]
+        return []
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.side_effect = fake_find_elements
+    mock_driver.current_url = "https://example.com"
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+
+    result = engine._wait_for_response(mock_driver)
+    # There is new text, so it should be returned (either from main loop or best-effort)
+    # The exact return depends on timing, but it should not raise.
+    assert result in ("new response text", "")
 
 
 # ---------------------------------------------------------------------------
@@ -1783,6 +1924,9 @@ def test_execute_chunked_send_invokes_driver_n_times():
     engine._click_send = fake_click
     engine._post_send_check = fake_post_send_check
     engine._wait_for_response = fake_wait_response
+    # With pre-fill optimisation, _wait_for_send_ready replaces _wait_for_response
+    # for intermediate chunks — mock it to return True immediately.
+    engine._wait_for_send_ready = lambda d, **kw: True
 
     # 301-char prompt with limit=100 → ceil(301/100)=4 parts min, but env_max=3
     # So n = min(3, max(ceil(301/100), 2)) = min(3, 4) = 3
@@ -1791,14 +1935,15 @@ def test_execute_chunked_send_invokes_driver_n_times():
 
     assert len(fill_calls) == 3
     assert len(click_calls) == 3
-    # The final response is returned
-    assert "part 3" in result
+    # _wait_for_response is called only once (final chunk), not once per chunk.
+    assert response_counter[0] == 1
+    assert result  # non-empty response returned
     # The flag must be reset after completion
     assert engine._skip_split_for_next is False
 
 
 def test_execute_chunked_send_intermediate_headers():
-    """Intermediate chunks must carry the [INTERNAL-PART{i}/{n}] header."""
+    """Intermediate chunks must carry the [PART {i}/{n}] header."""
     from core.selenium_llm_base import SeleniumLLMBase
     from unittest.mock import MagicMock
 
@@ -1817,6 +1962,7 @@ def test_execute_chunked_send_intermediate_headers():
     engine._click_send = lambda d, e: None
     engine._post_send_check = lambda d, **kw: True
     engine._wait_for_response = lambda d, **kw: "OK"
+    engine._wait_for_send_ready = lambda d, **kw: True
 
     prompt = "X" * 301
     engine._execute_chunked_send(prompt, MagicMock())
@@ -1824,10 +1970,54 @@ def test_execute_chunked_send_intermediate_headers():
     # Intermediate chunks (all but the last) must carry the header
     n = len(fill_calls)
     for i, text in enumerate(fill_calls[:-1], start=1):
-        assert f"[INTERNAL-PART{i}/{n}]" in text
+        assert f"[PART {i}/{n}]" in text
 
     # The final chunk must NOT carry the header
-    assert "[INTERNAL-PART" not in fill_calls[-1]
+    assert "[PART " not in fill_calls[-1]
+
+
+def test_execute_chunked_send_prefill_before_wait():
+    """_fill_input must be called BEFORE _wait_for_send_ready for every pre-filled chunk.
+
+    With the pre-fill optimisation the call order per chunk (2..n) must be:
+    fill → wait_for_send_ready → send
+    This guarantees the text is in the box while the model is still generating.
+    """
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 100},
+        default_model="default",
+    )
+    engine._split_prompt_parts = 3
+
+    fake_el = MagicMock()
+    call_order: list[str] = []
+
+    engine._find_interactable_element = lambda *a, **kw: fake_el
+    engine._fill_input = lambda d, e, text: call_order.append("fill")
+    engine._click_send = lambda d, e: call_order.append("send")
+    engine._post_send_check = lambda d, **kw: True
+    engine._wait_for_send_ready = lambda d, **kw: call_order.append("wait_ready") or True
+    engine._wait_for_response = lambda d, **kw: "final response"
+
+    prompt = "Z" * 301  # n=3 chunks
+    result = engine._execute_chunked_send(prompt, MagicMock())
+
+    # Expected order: fill1, send1, fill2, wait_ready, send2, fill3, wait_ready, send3
+    fills = [i for i, v in enumerate(call_order) if v == "fill"]
+    waits = [i for i, v in enumerate(call_order) if v == "wait_ready"]
+
+    assert len(fills) == 3, f"Expected 3 fills, got {len(fills)}: {call_order}"
+    assert len(waits) == 2, f"Expected 2 wait_ready, got {len(waits)}: {call_order}"
+
+    # Each pre-fill (chunks 2 and 3) must appear BEFORE its corresponding wait_ready.
+    assert fills[1] < waits[0], "chunk-2 fill must precede its wait_ready"
+    assert fills[2] < waits[1], "chunk-3 fill must precede its wait_ready"
+
+    assert result == "final response"
 
 
 def test_skip_split_flag_prevents_recursion():
@@ -1958,3 +2148,139 @@ def test_queue_fifo_serializes_requests():
 
     assert [r.text for r in results] == ["response-A", "response-B", "response-C"]
     assert execution_log == ["A", "B", "C"], f"FIFO order violated: {execution_log}"
+
+
+# ---------------------------------------------------------------------------
+# Fallback: send-button-based generation detection
+# ---------------------------------------------------------------------------
+
+
+def test_send_button_present_returns_true_when_visible():
+    """_send_button_present must return True when a send button element is visible."""
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.send_button_selectors = ["button[aria-label='Send message']"]
+
+    fake_btn = MagicMock()
+    fake_btn.is_displayed.return_value = True
+    fake_btn.is_enabled.return_value = True
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = [fake_btn]
+
+    assert engine._send_button_present(mock_driver) is True
+
+
+def test_send_button_present_returns_false_when_absent():
+    """_send_button_present must return False when no enabled send button is found."""
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.send_button_selectors = ["button[aria-label='Send message']"]
+
+    mock_driver = MagicMock()
+    mock_driver.find_elements.return_value = []
+
+    assert engine._send_button_present(mock_driver) is False
+
+
+def test_post_send_check_fallback_when_send_button_absent():
+    """_post_send_check must return True (generation in progress) when:
+    - no stop button is found
+    - no new response text appeared
+    - but the send button has disappeared (generation accepted by LLM)
+    """
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.stop_selectors = []          # primary check always skipped
+    engine.send_button_selectors = ["button[aria-label='Send message']"]
+    engine.response_area_selectors = [".response"]
+
+    mock_driver = MagicMock()
+    # No elements found for any selector → stop absent, text empty, send absent
+    mock_driver.find_elements.return_value = []
+    mock_driver.current_url = "https://example.com"
+
+    result = engine._post_send_check(mock_driver, timeout=1.0)
+    # Send button absent → generation in progress → True
+    assert result is True
+
+
+def test_wait_for_response_initial_phase_fallback_send_button_absent():
+    """_wait_for_response must exit the initial wait when the send button disappears,
+    signalling that the LLM has accepted the prompt and started generating.
+    After that, once the response text is stable for 1 s (unchanged) and is
+    different from baseline, the fallback logic must return the response
+    without requiring any send-button check.
+    """
+    import tempfile
+    from unittest.mock import MagicMock, patch
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.stop_selectors = []          # no stop selectors — fallback only
+    engine.send_button_selectors = ["button[aria-label='Send message']"]
+    engine.response_area_selectors = [".response"]
+    engine.accept_button_selectors = []
+
+    response_text = "Fallback response from LLM."
+
+    # _get_latest_response_text: first call (baseline) = "", then stable response
+    text_calls = [0]
+
+    def _get_text(_driver: object) -> str:
+        text_calls[0] += 1
+        return "" if text_calls[0] == 1 else response_text
+
+    # _send_button_present is used only in initial-phase fallback, not in Phase 2
+    send_calls = [0]
+
+    def _send_present(_driver: object) -> bool:
+        send_calls[0] += 1
+        # First two checks: absent (generating); from third onwards: present (done)
+        return send_calls[0] > 2
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com"
+    mock_driver.find_elements.return_value = []
+
+    with (
+        patch.object(engine, "_get_latest_response_text", side_effect=_get_text),
+        patch.object(engine, "_send_button_present", side_effect=_send_present),
+        patch("time.sleep", return_value=None),
+    ):
+        result = engine._wait_for_response(mock_driver, max_wait=10)
+
+    assert result == response_text

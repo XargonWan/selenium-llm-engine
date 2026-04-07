@@ -495,6 +495,10 @@ class SeleniumLLMBase:
         """Return True if *exc* signals a redirect-stall (prompt submitted but page navigated away)."""
         return "redirect-stall:" in str(exc).lower()
 
+    def _is_response_detection_timeout(self, exc: Exception) -> bool:
+        """Return True if *exc* signals that the LLM response was not detected in time."""
+        return "selenium_response_detection_timeout" in str(exc)
+
     def _reset_driver(self) -> None:
         """Kill the existing (dead) driver and reset state so _ensure_ready re-inits."""
         logger.warning("[selenium] Resetting dead driver session…")
@@ -592,6 +596,13 @@ class SeleniumLLMBase:
 
         Parts 1..N-1 are prefixed with an instruction telling the LLM not to
         respond yet.  Only the final part triggers a real reply.
+
+        Optimisation: after each intermediate chunk is accepted (_post_send_check
+        sees the stop button), the *next* chunk is pre-filled into the input area
+        immediately — while the model is still generating its acknowledgement.
+        Sending is deferred until just the send button becomes available again
+        (_wait_for_send_ready), skipping the full _wait_for_response round-trip
+        and its 1-second stability window for every intermediate chunk.
         """
         limit = self._get_model_limit(self.get_current_model())
         # Calculate the minimum number of parts that keeps every chunk inside the limit.
@@ -599,68 +610,107 @@ class SeleniumLLMBase:
         min_parts = math.ceil(len(prompt) / limit)
         n = min(self._split_prompt_parts, max(min_parts, 2))
         parts = self._split_prompt_into_parts(prompt, n)
+        chunk_t0 = time.time()
         logger.info(
             f"[selenium] Prompt chunking: {len(prompt)} chars split into {n} parts "
             f"(limit={limit}, env_max={self._split_prompt_parts})"
         )
 
-        for idx, part in enumerate(parts[:-1], start=1):
+        def _intermediate_text(idx: int, part: str) -> str:
             header = (
-                f"[INTERNAL-PART{idx}/{n}] This message contains part {idx} of {n} "
-                "of a large input. Read it carefully and keep it available for "
-                "subsequent messages. Do NOT respond to this part yet. "
-                "Reply ONLY with: OK\n\n"
+                f"[PART {idx}/{n}] Reply ONLY: OK\n\n"
             )
-            chunk_text = header + part
-            logger.debug(f"[selenium] Sending chunk {idx}/{n} ({len(chunk_text)} chars)")
+            return header + part
 
+        # --- Send first chunk ---
+        first_text = _intermediate_text(1, parts[0])
+        logger.debug(f"[selenium] Sending chunk 1/{n} ({len(first_text)} chars)")
+        input_el = self._find_interactable_element(
+            driver, self.prompt_area_selectors, timeout=20.0,
+            cache_attr="_cached_prompt_selector",
+        )
+        if input_el is None:
+            raise RuntimeError(f"Could not find prompt input area for chunk 1/{n}")
+        self._fill_input(driver, input_el, first_text)
+        self._click_accept_buttons(driver, timeout=2.0)
+        self._click_send(driver, input_el)
+        self._click_accept_buttons(driver, timeout=2.0)
+        if not self._post_send_check(driver):
+            self._cached_prompt_selector = None
+            self._cached_send_selector = None
+            raise RuntimeError(f"redirect-stall: chunk 1/{n} not accepted after redirect")
+        logger.info(f"[timing] chunk 1/{n} sent+accepted: {time.time() - chunk_t0:.2f}s")
+
+        # --- Pre-fill and send remaining chunks while previous is generating ---
+        # For each subsequent chunk: fill the input DURING generation of the
+        # previous chunk, then only wait for the send button to reappear.
+        for idx in range(2, n + 1):
+            is_final = idx == n
+            next_text = parts[-1] if is_final else _intermediate_text(idx, parts[idx - 1])
+            chunk_start = time.time()
+            logger.debug(
+                f"[selenium] Pre-filling {'final ' if is_final else ''}chunk {idx}/{n} "
+                f"({len(next_text)} chars) during generation of chunk {idx - 1}/{n}"
+            )
+
+            # Pre-fill while the model is still generating the previous response.
             input_el = self._find_interactable_element(
-                driver, self.prompt_area_selectors, timeout=20.0,
+                driver, self.prompt_area_selectors, timeout=5.0,
                 cache_attr="_cached_prompt_selector",
             )
             if input_el is None:
                 raise RuntimeError(f"Could not find prompt input area for chunk {idx}/{n}")
+            self._fill_input(driver, input_el, next_text)
+            prefill_elapsed = time.time() - chunk_start
 
-            self._fill_input(driver, input_el, chunk_text)
-            self._click_accept_buttons(driver, timeout=2.0)
-            self._click_send(driver, input_el)
-            self._click_accept_buttons(driver, timeout=2.0)
-            if not self._post_send_check(driver):
-                self._cached_prompt_selector = None
-                self._cached_send_selector = None
+            # Wait only for the send button to reappear (generation of previous chunk done).
+            send_ready_start = time.time()
+            if not self._wait_for_send_ready(driver):
                 raise RuntimeError(
-                    f"redirect-stall: chunk {idx}/{n} not accepted after redirect"
+                    f"Send button did not become ready after chunk {idx - 1}/{n}"
                 )
-            intermediate = self._wait_for_response(driver)
-            if not intermediate:
-                logger.warning(f"[selenium] Empty response for intermediate chunk {idx}/{n}")
-            else:
-                logger.debug(f"[selenium] Chunk {idx}/{n} acknowledged: {intermediate[:80]!r}")
-
-        # Send the final part and return the actual response.
-        logger.debug(f"[selenium] Sending final chunk {n}/{n} ({len(parts[-1])} chars)")
-        self._skip_split_for_next = True
-        try:
-            input_el = self._find_interactable_element(
-                driver, self.prompt_area_selectors, timeout=20.0,
-                cache_attr="_cached_prompt_selector",
+            send_ready_elapsed = time.time() - send_ready_start
+            logger.info(
+                f"[timing] chunk {idx}/{n} prefill={prefill_elapsed:.2f}s "
+                f"send_ready_wait={send_ready_elapsed:.2f}s"
             )
-            if input_el is None:
-                raise RuntimeError(f"Could not find prompt input area for final chunk {n}/{n}")
 
-            self._fill_input(driver, input_el, parts[-1])
-            self._click_accept_buttons(driver, timeout=2.0)
-            self._click_send(driver, input_el)
-            self._click_accept_buttons(driver, timeout=2.0)
-            if not self._post_send_check(driver):
-                self._cached_prompt_selector = None
-                self._cached_send_selector = None
-                raise RuntimeError(
-                    "redirect-stall: final chunk not accepted after redirect"
-                )
-            return self._wait_for_response(driver)
-        finally:
-            self._skip_split_for_next = False
+            if is_final:
+                self._skip_split_for_next = True
+                try:
+                    self._click_accept_buttons(driver, timeout=2.0)
+                    self._click_send(driver, input_el)
+                    self._click_accept_buttons(driver, timeout=2.0)
+                    if not self._post_send_check(driver):
+                        self._cached_prompt_selector = None
+                        self._cached_send_selector = None
+                        raise RuntimeError(
+                            "redirect-stall: final chunk not accepted after redirect"
+                        )
+                    response = self._wait_for_response(driver)
+                    logger.info(
+                        f"[timing] chunk {idx}/{n} (final) response: {time.time() - chunk_start:.2f}s"
+                    )
+                    logger.info(
+                        f"[timing] TOTAL chunked send: {time.time() - chunk_t0:.2f}s"
+                    )
+                    return response
+                finally:
+                    self._skip_split_for_next = False
+            else:
+                self._click_accept_buttons(driver, timeout=2.0)
+                self._click_send(driver, input_el)
+                self._click_accept_buttons(driver, timeout=2.0)
+                if not self._post_send_check(driver):
+                    self._cached_prompt_selector = None
+                    self._cached_send_selector = None
+                    raise RuntimeError(
+                        f"redirect-stall: chunk {idx}/{n} not accepted after redirect"
+                    )
+                logger.debug(f"[selenium] Chunk {idx}/{n} accepted (pre-filled during generation)")
+
+        # Never reached: n >= 2 is guaranteed by max(min_parts, 2).
+        raise RuntimeError("_execute_chunked_send: unexpected exit after loop")
 
     # ------------------------------------------------------------------ core flow
 
@@ -685,12 +735,20 @@ class SeleniumLLMBase:
                             f"[selenium] Redirect-stall on attempt {attempt + 1}, retrying without driver reset…"
                         )
                         continue
+                    if self._is_response_detection_timeout(e):
+                        logger.warning(
+                            f"[selenium] Response detection timeout on attempt {attempt + 1}, "
+                            "resetting driver and retrying…"
+                        )
+                        self._reset_driver()
+                        continue
                 raise
         # Should not be reached, but satisfy mypy
         raise RuntimeError("_sync_generate_response exhausted retries")
 
     def _sync_generate_response_once(self, prompt: str, media: list[Any] | None = None) -> str:
         """Single attempt of the core generate flow."""
+        t0 = time.time()
         self._ensure_ready()
 
         unlogged = not self.is_user_logged_in()
@@ -723,6 +781,9 @@ class SeleniumLLMBase:
                     ) from nav_err
                 raise
             self._wait_for_page_ready(driver, timeout=30.0)
+
+        t1 = time.time()
+        logger.info(f"[timing] page_ready: {t1 - t0:.2f}s")
 
         if self._is_captcha_present(driver):
             logger.warning("[selenium] Cloudflare captcha challenge detected on page")
@@ -761,7 +822,13 @@ class SeleniumLLMBase:
             if input_el is None:
                 raise RuntimeError("Could not find prompt input area")
 
+            t2 = time.time()
+            logger.info(f"[timing] find_element: {t2 - t1:.2f}s")
+
             self._fill_input(driver, input_el, prompt)
+            t3 = time.time()
+            logger.info(f"[timing] fill_input: {t3 - t2:.2f}s ({len(prompt)} chars)")
+
             self._click_accept_buttons(driver, timeout=2.0)
             if media:
                 if not self._wait_for_send_button_after_media_upload(driver):
@@ -773,6 +840,9 @@ class SeleniumLLMBase:
                         "Please verify the file and try again."
                     )
             self._click_send(driver, input_el)
+            t4 = time.time()
+            logger.info(f"[timing] click_send: {t4 - t3:.2f}s")
+
             self._click_accept_buttons(driver, timeout=2.0)
             if not self._post_send_check(driver):
                 self._cached_prompt_selector = None
@@ -780,7 +850,14 @@ class SeleniumLLMBase:
                 raise RuntimeError(
                     "redirect-stall: send not accepted after redirect"
                 )
-            return self._wait_for_response(driver)
+            t5 = time.time()
+            logger.info(f"[timing] post_send_check: {t5 - t4:.2f}s")
+
+            response = self._wait_for_response(driver)
+            t6 = time.time()
+            logger.info(f"[timing] wait_for_response: {t6 - t5:.2f}s")
+            logger.info(f"[timing] TOTAL generate: {t6 - t0:.2f}s")
+            return response
 
         except Exception as e:
             if self._is_dead_session(e):
@@ -1220,6 +1297,26 @@ class SeleniumLLMBase:
                 pass
         return ""
 
+    def _send_button_present(self, driver: Any) -> bool:
+        """Return True if a send button is currently visible and enabled on the page.
+
+        Used as a fallback generation-complete signal: LLMs typically hide the
+        send button while streaming and re-show it once the response is done.
+        Send button present → generation finished; send button absent → still generating.
+        """
+        for sel in self.send_button_selectors:
+            try:
+                btns = driver.find_elements(By.CSS_SELECTOR, sel)
+                for b in btns:
+                    try:
+                        if b.is_displayed() and b.is_enabled():
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return False
+
     def _find_interactable_element(
         self,
         driver: Any,
@@ -1519,6 +1616,34 @@ class SeleniumLLMBase:
         except Exception as e:
             logger.error(f"[selenium] Could not send prompt: {e}")
 
+    def _wait_for_send_ready(self, driver: Any, timeout: float = 30.0) -> bool:
+        """Wait until the send button is visible and enabled (generation complete).
+
+        Used by chunked sending to detect when the model has finished generating
+        its acknowledgement and the pre-filled next chunk can be submitted.
+        Polls every 0.2 s up to *timeout* seconds.
+        Env var: ``SELENIUM_SEND_READY_TIMEOUT`` overrides the default.
+        """
+        timeout = float(os.getenv("SELENIUM_SEND_READY_TIMEOUT", str(timeout)))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for sel in self.send_button_selectors:
+                try:
+                    btns = driver.find_elements(By.CSS_SELECTOR, sel)
+                    for btn in btns:
+                        try:
+                            if btn.is_displayed() and btn.is_enabled():
+                                logger.debug(f"[selenium] Send button ready: {sel}")
+                                return True
+                        except Exception:
+                            pass
+                except Exception as e:
+                    if self._is_dead_session(e):
+                        raise
+            time.sleep(0.2)
+        logger.warning(f"[selenium] Send button did not become ready within {timeout:.1f}s")
+        return False
+
     def _post_send_check(self, driver: Any, timeout: float = 15.0) -> bool:
         """Return True if the LLM accepted the prompt (stop button or new text appeared).
 
@@ -1552,7 +1677,21 @@ class SeleniumLLMBase:
             if cur and cur != baseline:
                 logger.debug("[selenium] post_send_check: new response text appeared — send accepted")
                 return True
-            time.sleep(0.5)
+            # Fallback: if the send button has disappeared the LLM is generating.
+            # Guard: if we are already on a redirect URL, don't interpret absent
+            # send button as "generation started" — it means the page changed.
+            _fb_url = ""
+            try:
+                _fb_url = driver.current_url or ""
+            except Exception:
+                pass
+            if self.service_url and _fb_url and not _fb_url.startswith(self.service_url):
+                logger.warning("[selenium] post_send_check: redirect detected — returning False")
+                return False
+            if not self._send_button_present(driver):
+                logger.debug("[selenium] post_send_check fallback: send button absent — generation in progress")
+                return True
+            time.sleep(0.2)
 
         # Timeout expired — check if we are still on the expected page
         cur_url = ""
@@ -1584,14 +1723,35 @@ class SeleniumLLMBase:
         initial_timeout = float(os.getenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "60"))
         start = time.time()
         poll_interval = 0.1
+        _initial_new_text_found = False
         while time.time() - start < initial_timeout:
             cur = self._get_latest_response_text(driver)
             if cur and cur != baseline:
                 logger.debug("[selenium] New response text appeared")
+                _initial_new_text_found = True
+                break
+            # If generation has started (stop-button visible), move directly to the
+            # stability-wait phase below — the model will produce text shortly.
+            for _sel in self.stop_selectors:
+                try:
+                    _bs = driver.find_elements(By.CSS_SELECTOR, _sel)
+                    if any(self._element_is_displayed(_b) for _b in _bs):
+                        logger.debug("[selenium] Generation started (stop button visible), entering stable-loop early")
+                        _initial_new_text_found = True  # signals: do NOT warn
+                        break
+                except Exception as _e:
+                    if self._is_dead_session(_e):
+                        raise
+            if _initial_new_text_found:
+                break
+            # Fallback: if the send button disappeared the LLM accepted the prompt
+            if not self._send_button_present(driver):
+                logger.debug("[selenium] Generation started (send button absent) — fallback signal")
+                _initial_new_text_found = True
                 break
             time.sleep(poll_interval)
-            poll_interval = min(poll_interval * 2, 1.0)
-        else:
+            poll_interval = min(poll_interval * 2, 0.5)
+        if not _initial_new_text_found:
             logger.warning(
                 f"[selenium] Response area did not produce new text within {initial_timeout}s"
             )
@@ -1601,6 +1761,9 @@ class SeleniumLLMBase:
         start = time.time()
         first_new = ""
         stable_since = time.time()
+        # Fallback trackers: text-stability + send-button presence
+        _fb_last_text: str = ""
+        _fb_stable_since: float = time.time()
 
         while time.time() - start < max_wait:
             generating = False
@@ -1622,8 +1785,9 @@ class SeleniumLLMBase:
                         raise
 
             if generating:
-                time.sleep(0.5)
+                time.sleep(0.3)
                 stable_since = time.time()
+                _fb_stable_since = time.time()  # reset fallback timer while generating
                 continue
 
             cur = self._get_latest_response_text(driver)
@@ -1645,18 +1809,35 @@ class SeleniumLLMBase:
                     )
                     return first_new
 
-                if time.time() - stable_since >= 1.0:
+                if time.time() - stable_since >= 0.5:
                     logger.debug("[selenium] Response stable — done")
                     return first_new
             elif first_new:
-                if time.time() - stable_since >= 1.0:
+                if time.time() - stable_since >= 0.5:
                     logger.debug("[selenium] First new response stable — done")
                     return first_new
 
-            time.sleep(0.3)
+            # Fallback: text-stability only.
+            # When the response text has not changed for 1 s and is different
+            # from baseline, the LLM has finished generating.
+            if cur != _fb_last_text:
+                _fb_last_text = cur
+                _fb_stable_since = time.time()
+            elif time.time() - _fb_stable_since >= 1.0:
+                result = cur if (cur and cur != baseline) else first_new
+                if result:
+                    logger.debug("[selenium] Fallback: text stable 1 s — done")
+                    return result
 
-        logger.warning("[selenium] Response wait timed out, returning best-effort result")
-        return first_new or baseline
+            time.sleep(0.15)
+
+        if first_new:
+            logger.warning("[selenium] Response wait timed out, returning best-effort result")
+            return first_new
+        raise RuntimeError(
+            "selenium_response_detection_timeout: no new response text appeared "
+            "in expected selectors within the allotted time"
+        )
 
     def _click_accept_buttons(self, driver: Any, timeout: float = 2.0) -> None:
         """Click any configured accept buttons that appear before continuing."""

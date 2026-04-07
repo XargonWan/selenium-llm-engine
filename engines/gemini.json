@@ -34,7 +34,13 @@
     ],
     "base_account_selector": "#app-root > main > top-bar-actions > div > div.right-section > div.buttons-container.adv-upsell.ng-star-inserted > g1-dynamic-upsell-button",
     "response_area": [
+      "model-response .markdown-main-panel",
+      "message-content .markdown-main-panel",
+      ".markdown-main-panel",
       "model-response .markdown",
+      "message-content .markdown",
+      "model-response response-container .markdown",
+      "structured-content-container .markdown",
       "model-response",
       ".model-response",
       ".response-container",
@@ -51,7 +57,9 @@
       "button[aria-label='Cancel']",
       "button[aria-label*='Stop']",
       ".stop-button",
-      "[data-testid='stop-button']"
+      "[data-testid='stop-button']",
+      "mat-icon[fonticon='stop']",
+      "button mat-icon[fonticon='stop']"
     ]
   },
   "media_support": {

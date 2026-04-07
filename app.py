@@ -631,7 +631,24 @@ async def _prompt(
 
             async def generate_stream():
                 try:
-                    result_obj = await mgr.enqueue(engine_name, prompt_text, media_items)
+                    # Start engine work as a concurrent task so we can yield
+                    # SSE heartbeats while waiting, keeping the connection alive.
+                    result_future = asyncio.ensure_future(
+                        mgr.enqueue(engine_name, prompt_text, media_items)
+                    )
+
+                    heartbeat_interval = 5.0  # seconds
+                    while not result_future.done():
+                        done, _ = await asyncio.wait(
+                            {result_future},
+                            timeout=heartbeat_interval,
+                        )
+                        if not done:
+                            # SSE comment — keeps HTTP connection alive without
+                            # injecting data into the content stream.
+                            yield ": heartbeat\n\n"
+
+                    result_obj = result_future.result()
                     elapsed_ms = int((time.time() - start) * 1000)
                     if media_items:
                         inc_media_sent(len(media_items))
