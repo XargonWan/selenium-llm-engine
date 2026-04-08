@@ -346,6 +346,36 @@ async def api_engines() -> Dict[str, Any]:
     return {"data": mgr.list_engines()}
 
 
+@app.get("/api/debug/page-html", response_class=HTMLResponse)
+async def api_debug_page_html(engine_name: str | None = None) -> HTMLResponse:
+    """Return the current page HTML from the requested engine's browser session."""
+    mgr = EngineManager.get()
+    try:
+        if engine_name:
+            engine = mgr.get_engine(engine_name)
+        else:
+            engine = mgr.get_active_engine()
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    driver = getattr(engine, "driver", None)
+    if not driver:
+        raise HTTPException(
+            status_code=404,
+            detail="No active browser session for the selected engine",
+        )
+
+    try:
+        html = driver.page_source
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve page source: {exc}",
+        )
+
+    return HTMLResponse(content=html)
+
+
 @app.get("/api/engines/default")
 async def api_engines_default() -> Dict[str, Any]:
     """Get the currently configured default engine."""

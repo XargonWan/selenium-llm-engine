@@ -1303,6 +1303,43 @@ def test_click_send_handles_stale_first_selector():
     assert base._cached_send_selector == "button.send2"
 
 
+def test_fill_input_retries_on_stale_element():
+    """_fill_input should recover from a stale input element by refinding it."""
+    try:
+        from core.selenium_llm_base import SeleniumLLMBase
+    except ModuleNotFoundError:
+        pytest.skip("undetected_chromedriver not compatible with this Python version")
+
+    from selenium.common.exceptions import StaleElementReferenceException
+    from unittest.mock import MagicMock
+
+    base = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    first_input = MagicMock()
+    second_input = MagicMock()
+    first_input.tag_name = "textarea"
+    second_input.tag_name = "textarea"
+    first_input.click.side_effect = StaleElementReferenceException("stale")
+    first_input.clear.side_effect = StaleElementReferenceException("stale")
+    second_input.click.return_value = None
+    second_input.clear.return_value = None
+    second_input.send_keys.return_value = None
+    second_input.tag_name = "textarea"
+
+    def find_input(driver, selectors, timeout, cache_attr=None):
+        return second_input
+
+    base._find_interactable_element = find_input
+
+    base._fill_input(MagicMock(), first_input, "hello world")
+
+    assert second_input.clear.called
+    assert second_input.send_keys.called
+
+
 def test_wait_for_send_button_after_media_upload_returns_true_when_button_appears():
     import tempfile
 
@@ -1794,6 +1831,47 @@ def test_sync_generate_response_retries_on_response_detection_timeout():
     assert result == "real response"
     assert call_count == 2
     assert reset_called == [True], "Driver MUST be reset on response detection timeout"
+
+
+def test_sync_generate_response_once_retries_on_stale_element():
+    """_sync_generate_response_once should retry once when a stale element occurs."""
+    import tempfile
+
+    from core.selenium_llm_base import SeleniumLLMBase
+    from selenium.common.exceptions import StaleElementReferenceException
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.driver = MagicMock()
+    engine._initialized = True
+    engine.driver.current_url = "https://example.com"
+
+    engine._find_interactable_element = lambda driver, selectors, timeout, cache_attr=None: MagicMock()
+    engine._fill_input = lambda driver, el, prompt: None
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    engine._post_send_check = lambda driver: True
+    engine._wait_for_response = lambda driver: "final response"
+    engine._is_dead_session = lambda exc: False
+
+    call_count = 0
+
+    def fake_click_send(driver, input_el):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise StaleElementReferenceException("stale element")
+        return None
+
+    engine._click_send = fake_click_send
+
+    result = engine._sync_generate_response_once("hello")
+    assert result == "final response"
+    assert call_count == 2
 
 
 def test_wait_for_response_raises_on_detection_timeout(monkeypatch):

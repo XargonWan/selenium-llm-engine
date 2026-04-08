@@ -858,59 +858,78 @@ class SeleniumLLMBase:
         if not self._skip_split_for_next and not media and self._should_split_prompt(prompt):
             return self._execute_chunked_send(prompt, driver)
 
-        try:
-            input_el = self._find_interactable_element(
-                driver, self.prompt_area_selectors, timeout=20.0,
-                cache_attr="_cached_prompt_selector",
-            )
-            if input_el is None:
-                raise RuntimeError("Could not find prompt input area")
+        stale_retries = 0
+        while True:
+            try:
+                input_el = self._find_interactable_element(
+                    driver, self.prompt_area_selectors, timeout=20.0,
+                    cache_attr="_cached_prompt_selector",
+                )
+                if input_el is None:
+                    raise RuntimeError("Could not find prompt input area")
 
-            t2 = time.time()
-            logger.info(f"[timing] find_element: {t2 - t1:.2f}s")
+                t2 = time.time()
+                logger.info(f"[timing] find_element: {t2 - t1:.2f}s")
 
-            self._fill_input(driver, input_el, prompt)
-            t3 = time.time()
-            logger.info(f"[timing] fill_input: {t3 - t2:.2f}s ({len(prompt)} chars)")
+                self._fill_input(driver, input_el, prompt)
+                t3 = time.time()
+                logger.info(f"[timing] fill_input: {t3 - t2:.2f}s ({len(prompt)} chars)")
 
-            self._click_accept_buttons(driver, timeout=2.0)
-            if media:
-                if not self._wait_for_send_button_after_media_upload(driver):
-                    logger.warning(
-                        "[selenium] Send button not ready after media upload"
+                self._click_accept_buttons(driver, timeout=2.0)
+                if media:
+                    if not self._wait_for_send_button_after_media_upload(driver):
+                        logger.warning(
+                            "[selenium] Send button not ready after media upload"
+                        )
+                        return (
+                            "⚠️ Media upload failed. "
+                            "Please verify the file and try again."
+                        )
+                self._click_send(driver, input_el)
+                t4 = time.time()
+                logger.info(f"[timing] click_send: {t4 - t3:.2f}s")
+
+                self._click_accept_buttons(driver, timeout=2.0)
+                if not self._post_send_check(driver):
+                    self._cached_prompt_selector = None
+                    self._cached_send_selector = None
+                    raise RuntimeError(
+                        "redirect-stall: send not accepted after redirect"
                     )
-                    return (
-                        "⚠️ Media upload failed. "
-                        "Please verify the file and try again."
-                    )
-            self._click_send(driver, input_el)
-            t4 = time.time()
-            logger.info(f"[timing] click_send: {t4 - t3:.2f}s")
+                t5 = time.time()
+                logger.info(f"[timing] post_send_check: {t5 - t4:.2f}s")
 
-            self._click_accept_buttons(driver, timeout=2.0)
-            if not self._post_send_check(driver):
+                response = self._wait_for_response(driver)
+                t6 = time.time()
+                logger.info(f"[timing] wait_for_response: {t6 - t5:.2f}s")
+                logger.info(f"[timing] TOTAL generate: {t6 - t0:.2f}s")
+                return response
+
+            except StaleElementReferenceException as e:
+                stale_retries += 1
                 self._cached_prompt_selector = None
                 self._cached_send_selector = None
-                raise RuntimeError(
-                    "redirect-stall: send not accepted after redirect"
+                if stale_retries >= 2:
+                    logger.error(
+                        "[selenium] _sync_generate_response_once failed after stale element retry: %s",
+                        e,
+                    )
+                    raise
+                logger.warning(
+                    "[selenium] Stale element detected mid-prompt; retrying prompt flow (%s/2): %s",
+                    stale_retries,
+                    e,
                 )
-            t5 = time.time()
-            logger.info(f"[timing] post_send_check: {t5 - t4:.2f}s")
+                continue
 
-            response = self._wait_for_response(driver)
-            t6 = time.time()
-            logger.info(f"[timing] wait_for_response: {t6 - t5:.2f}s")
-            logger.info(f"[timing] TOTAL generate: {t6 - t0:.2f}s")
-            return response
-
-        except Exception as e:
-            if self._is_dead_session(e):
-                self._reset_driver()
-                raise RuntimeError(f"Driver session died mid-prompt: {e}") from e
-            logger.error(f"[selenium] _sync_generate_response_once failed: {e}")
-            if unlogged:
-                return f"⚠️ Unlogged session: could not run full prompt flow. Error: {e}"
-            raise
+            except Exception as e:
+                if self._is_dead_session(e):
+                    self._reset_driver()
+                    raise RuntimeError(f"Driver session died mid-prompt: {e}") from e
+                logger.error(f"[selenium] _sync_generate_response_once failed: {e}")
+                if unlogged:
+                    return f"⚠️ Unlogged session: could not run full prompt flow. Error: {e}"
+                raise
 
     # ------------------------------------------------------------------ media helpers
 
@@ -1422,9 +1441,18 @@ class SeleniumLLMBase:
     def _get_latest_response_text(self, driver: Any) -> str:
         """Return latest non-empty text from response selectors, or empty if none."""
         candidates: list[str] = []
+        logger.debug(
+            "[selenium] _get_latest_response_text: trying selectors=%s",
+            self.response_area_selectors,
+        )
         for sel in self.response_area_selectors:
             try:
                 els = driver.find_elements(By.CSS_SELECTOR, sel)
+                logger.debug(
+                    "[selenium] _get_latest_response_text: selector=%s found %d elements",
+                    sel,
+                    len(els),
+                )
                 if not els:
                     continue
 
@@ -1572,80 +1600,104 @@ class SeleniumLLMBase:
 
     def _fill_input(self, driver: Any, element: Any, text: str) -> None:
         """Type *text* into a textarea or contenteditable element."""
-        try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", element
-            )
-            time.sleep(0.2)
-        except Exception:
-            pass
-
-        try:
-            element.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", element)
-        time.sleep(0.1)
-
-        tag = (element.tag_name or "").lower()
-        if tag in ("textarea", "input"):
-            # Standard form inputs: clear via clear() then type
+        attempts = 0
+        while True:
             try:
-                element.clear()
-            except Exception:
                 try:
-                    element.send_keys(Keys.CONTROL + "a")
-                    element.send_keys(Keys.DELETE)
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", element
+                    )
+                    time.sleep(0.2)
                 except Exception:
                     pass
-            element.send_keys(text)
-        else:
-            # contenteditable (ProseMirror, Quill, …)
-            # Prefer JS execCommand: instant, no char-by-char latency.  Fall back
-            # to send_keys if execCommand is unavailable or raises.
-            js_ok = False
-            try:
-                driver.execute_script(
-                    "arguments[0].focus();"
-                    "document.execCommand('selectAll', false, null);"
-                    "document.execCommand('insertText', false, arguments[1]);",
-                    element,
-                    text,
-                )
-                js_ok = True
-            except Exception:
-                pass
-            if not js_ok:
+
                 try:
-                    element.send_keys(Keys.CONTROL + "a")
-                    time.sleep(0.05)
+                    element.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", element)
+                time.sleep(0.1)
+
+                tag = (element.tag_name or "").lower()
+                if tag in ("textarea", "input"):
+                    # Standard form inputs: clear via clear() then type
+                    try:
+                        element.clear()
+                    except Exception:
+                        try:
+                            element.send_keys(Keys.CONTROL + "a")
+                            element.send_keys(Keys.DELETE)
+                        except Exception:
+                            pass
                     element.send_keys(text)
-                except Exception as e:
-                    logger.error(f"[selenium] fill_input send_keys failed: {e}")
-                    raise
-            else:
-                # Some frameworks distinguish programmatic updates from user key events.
-                # Trigger a whitespace keypress + backspace to force UI internals to re-evaluate
-                # and enable the send button as if input was typed by the user.
+                else:
+                    # contenteditable (ProseMirror, Quill, …)
+                    # Prefer JS execCommand: instant, no char-by-char latency.  Fall back
+                    # to send_keys if execCommand is unavailable or raises.
+                    js_ok = False
+                    try:
+                        driver.execute_script(
+                            "arguments[0].focus();"
+                            "document.execCommand('selectAll', false, null);"
+                            "document.execCommand('insertText', false, arguments[1]);",
+                            element,
+                            text,
+                        )
+                        js_ok = True
+                    except Exception:
+                        pass
+                    if not js_ok:
+                        try:
+                            element.send_keys(Keys.CONTROL + "a")
+                            time.sleep(0.05)
+                            element.send_keys(text)
+                        except Exception as e:
+                            logger.error(f"[selenium] fill_input send_keys failed: {e}")
+                            raise
+                    else:
+                        # Some frameworks distinguish programmatic updates from user key events.
+                        # Trigger a whitespace keypress + backspace to force UI internals to re-evaluate
+                        # and enable the send button as if input was typed by the user.
+                        try:
+                            element.send_keys(Keys.SPACE, Keys.BACKSPACE)
+                        except Exception:
+                            pass
+
+                # Dispatch input/change events so that React/Vue/framework state machines
+                # immediately enable the send button without waiting for synthetic events.
                 try:
-                    element.send_keys(Keys.SPACE, Keys.BACKSPACE)
+                    driver.execute_script(
+                        "arguments[0].dispatchEvent("
+                        "  new InputEvent('input', {bubbles:true, cancelable:true})"
+                        ");"
+                        "arguments[0].dispatchEvent("
+                        "  new Event('change', {bubbles:true})"
+                        ");",
+                        element,
+                    )
                 except Exception:
                     pass
-
-        # Dispatch input/change events so that React/Vue/framework state machines
-        # immediately enable the send button without waiting for synthetic events.
-        try:
-            driver.execute_script(
-                "arguments[0].dispatchEvent("
-                "  new InputEvent('input', {bubbles:true, cancelable:true})"
-                ");"
-                "arguments[0].dispatchEvent("
-                "  new Event('change', {bubbles:true})"
-                ");",
-                element,
-            )
-        except Exception:
-            pass
-        logger.debug(f"[selenium] Filled input ({len(text)} chars)")
+                logger.debug(f"[selenium] Filled input ({len(text)} chars)")
+                return
+            except StaleElementReferenceException as exc:
+                attempts += 1
+                logger.warning(
+                    "[selenium] fill_input stale element reference; retrying (%s/2): %s",
+                    attempts,
+                    exc,
+                )
+                if attempts >= 2:
+                    raise
+                element = self._find_interactable_element(
+                    driver,
+                    self.prompt_area_selectors,
+                    timeout=5.0,
+                    cache_attr="_cached_prompt_selector",
+                )
+                if element is None:
+                    raise RuntimeError(
+                        "Could not find prompt input area after stale element during fill_input"
+                    )
+                continue
 
     def _click_send(self, driver: Any, input_el: Any) -> None:
         """Click the send button, or fall back to the Enter key.
