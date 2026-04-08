@@ -1531,6 +1531,113 @@ class SeleniumLLMBase:
                 pass
         return False
 
+    def _find_response_container_element(
+        self,
+        driver: Any,
+    ) -> tuple[Any | None, str | None]:
+        """Return the most relevant response container element for configured selectors."""
+        for sel in self.response_area_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, sel)
+                logger.debug(
+                    "[selenium] _find_response_container_element: selector=%s found %d elements",
+                    sel,
+                    len(elements),
+                )
+                if not elements:
+                    continue
+
+                visible = [el for el in elements if self._element_is_displayed(el)]
+                if visible:
+                    return visible[-1], sel
+                return elements[-1], sel
+            except Exception as exc:
+                logger.debug(
+                    "[selenium] _find_response_container_element: selector=%s error=%s",
+                    sel,
+                    exc,
+                )
+        return None, None
+
+    def _get_response_container_stats(
+        self,
+        driver: Any,
+        element: Any,
+    ) -> tuple[int, int]:
+        """Return generic container metrics used by the response watcher."""
+        try:
+            result = driver.execute_script(
+                "const el = arguments[0];"
+                "return [el?.innerText?.length || 0, el?.childElementCount || 0];",
+                element,
+            )
+            if (
+                isinstance(result, list)
+                and len(result) == 2
+                and isinstance(result[0], int)
+                and isinstance(result[1], int)
+            ):
+                return result[0], result[1]
+        except Exception as exc:
+            logger.debug(
+                "[selenium] _get_response_container_stats: JS failed: %s",
+                exc,
+            )
+
+        try:
+            text = (element.text or "").strip()
+            count = int(getattr(element, "childElementCount", 0) or 0)
+            return len(text), count
+        except Exception:
+            return 0, 0
+
+    def _extract_response_text_from_element(
+        self,
+        driver: Any,
+        element: Any,
+    ) -> str:
+        """Extract the response text from the watched container element."""
+        try:
+            result = driver.execute_script(
+                "const el = arguments[0];"
+                "return el && (el.innerText || el.textContent) ? (el.innerText || el.textContent).trim() : '';",
+                element,
+            )
+            if isinstance(result, str):
+                return result.strip()
+        except Exception as exc:
+            logger.debug(
+                "[selenium] _extract_response_text_from_element: JS failed: %s",
+                exc,
+            )
+
+        try:
+            return (element.text or "").strip()
+        except Exception:
+            return ""
+
+    def _log_response_container_diagnostics(
+        self,
+        selector: str | None,
+        current_text_length: int,
+        current_child_count: int,
+        previous_text_length: int,
+        previous_child_count: int,
+        stable_counter: int,
+        iteration: int,
+    ) -> None:
+        """Log detailed watcher diagnostics for each monitoring iteration."""
+        logger.debug(
+            "[selenium] watcher iteration=%d selector=%s current_text_length=%d current_child_count=%d previous_text_length=%d previous_child_count=%d stable_counter=%d",
+            iteration,
+            selector,
+            current_text_length,
+            current_child_count,
+            previous_text_length,
+            previous_child_count,
+            stable_counter,
+        )
+
     def _find_interactable_element(
         self,
         driver: Any,
@@ -1957,9 +2064,12 @@ class SeleniumLLMBase:
         """Wait for the LLM response to fully stream, then return its text.
 
         Strategy:
-        1. Take current last response as baseline (conversation history).
-        2. Wait up to 30 s for a new response text different from baseline.
-        3. Poll until the response is stable (1 s) and stop button disappears.
+        1. Wait for the response container to appear and begin emitting text.
+        2. After a 3 second grace delay, poll the container every 1 second.
+        3. Track innerText length and childElementCount.
+        4. If either metric changes, generation is still in progress.
+        5. If both remain unchanged for 2 consecutive checks after activity starts,
+           assume generation has finished.
         """
         self._click_accept_buttons(driver, timeout=2.0)
         baseline = ""
@@ -1969,113 +2079,84 @@ class SeleniumLLMBase:
         else:
             logger.debug("[selenium] Skipping baseline comparison for this engine")
 
-        # Reset per-attempt generation tracker before Phase 1 so that any signal
-        # detected during Phase 1 is preserved into Phase 2.
         self._generation_was_active = False
 
-        initial_timeout = float(os.getenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "60"))
-        start = time.time()
-        poll_interval = 0.1
-        _initial_new_text_found = False
-        while time.time() - start < initial_timeout:
-            cur = self._get_latest_response_text(driver)
-            if cur and cur != baseline:
-                logger.debug("[selenium] New response text appeared")
-                _initial_new_text_found = True
-                break
-            # If generation has started (stop-button visible), move directly to the
-            # stability-wait phase below — the model will produce text shortly.
-            for _sel in self.stop_selectors:
-                try:
-                    _bs = driver.find_elements(By.CSS_SELECTOR, _sel)
-                    if any(self._element_is_displayed(_b) for _b in _bs):
-                        logger.debug("[selenium] Generation started (stop button visible), entering stable-loop early")
-                        _initial_new_text_found = True  # signals: do NOT warn
-                        break
-                except Exception as _e:
-                    if self._is_dead_session(_e):
-                        raise
-            if _initial_new_text_found:
-                break
-            # Fallback: if the send button disappeared the LLM accepted the prompt
-            if not self._send_button_present(driver):
-                logger.debug("[selenium] Generation started (send button absent) — fallback signal")
-                self._generation_was_active = True  # prompt accepted; never reset driver on timeout
-                _initial_new_text_found = True
-                break
-            time.sleep(poll_interval)
-            poll_interval = min(poll_interval * 2, 0.5)
-        if not _initial_new_text_found:
-            logger.warning(
-                f"[selenium] Response area did not produce new text within {initial_timeout}s"
-            )
+        logger.debug("[selenium] watcher initial delay: 3.0s before response monitoring")
+        time.sleep(3.0)
 
-        # Resolution order: per-engine override → env var → built-in default.
         _engine_max_wait = getattr(self, "_response_max_wait", None)
         effective_max_wait = int(_engine_max_wait) if _engine_max_wait else max_wait
         max_wait = int(os.getenv("SELENIUM_RESPONSE_MAX_WAIT", str(effective_max_wait)))
+        deadline = time.time() + max_wait
 
-        start = time.time()
-        # Inactivity-based timeout: last_activity is reset whenever the LLM shows
-        # any sign of life (stop-button visible, send-button absent, or text changes).
-        # max_wait = inactivity cap; max_wait * 3 = absolute safety-cap.
-        last_activity = time.time()
-        first_new = ""
-        stable_since = time.time()
-        _last_status_log: float = time.time()
-        # Fallback trackers: text-stability + send-button presence
-        _fb_last_text: str = ""
-        _fb_stable_since: float = time.time()
+        previous_text_length = -1
+        previous_child_count = -1
+        stable_counter = 0
+        iteration = 0
+        generated_activity = False
+        last_container = None
 
-        while time.time() - last_activity < max_wait and time.time() - start < max_wait * 3:
-            generating = False
-            for sel in self.stop_selectors:
-                try:
-                    btns = driver.find_elements(By.CSS_SELECTOR, sel)
-                    for b in btns:
-                        try:
-                            if b.is_displayed():
-                                generating = True
-                                break
-                        except Exception:
-                            pass
-                    if generating:
-                        break
-                except Exception as e:
-                    if self._is_dead_session(e):
-                        logger.error("[selenium] Driver died during stop-button check")
-                        raise
+        while time.time() < deadline:
+            iteration += 1
+            container, selector = self._find_response_container_element(driver)
+            if container is None:
+                logger.debug(
+                    "[selenium] watcher iteration=%d no response container element found",
+                    iteration,
+                )
+                self._log_response_container_diagnostics(
+                    None,
+                    0,
+                    0,
+                    previous_text_length,
+                    previous_child_count,
+                    stable_counter,
+                    iteration,
+                )
+            else:
+                last_container = container
+                current_text_length, current_child_count = self._get_response_container_stats(
+                    driver, container
+                )
+                self._log_response_container_diagnostics(
+                    selector,
+                    current_text_length,
+                    current_child_count,
+                    previous_text_length,
+                    previous_child_count,
+                    stable_counter,
+                    iteration,
+                )
 
-            if generating:
-                self._generation_was_active = True
-                last_activity = time.time()
-                time.sleep(0.3)
-                stable_since = time.time()
-                _fb_stable_since = time.time()  # reset fallback timer while generating
-                continue
-
-            # Check for silent processing: model received prompt but stop-button is
-            # hidden (e.g. Gemini 2.5 Flash thinking-mode hides the stop button
-            # while reasoning, before emitting any text).
-            # NOTE: we do NOT update last_activity here — we only mark
-            # _generation_was_active=True (prevents driver reset on timeout)
-            # and reset stable_since when mid-stream to prevent premature return.
-            # The inactivity timer must tick naturally so stuck sessions time out
-            # at max_wait rather than running to the max_wait*3 absolute cap.
-            if self.send_button_selectors:
-                try:
-                    if not self._send_button_present(driver):
+                if previous_text_length != -1 and previous_child_count != -1:
+                    if (
+                        current_text_length != previous_text_length
+                        or current_child_count != previous_child_count
+                    ):
+                        generated_activity = True
+                        stable_counter = 0
                         self._generation_was_active = True
-                        if first_new:
-                            # Model paused mid-stream: prevent premature stability
-                            # return but let inactivity timer work.
-                            stable_since = time.time()
-                except Exception as _st_e:
-                    if self._is_dead_session(_st_e):
-                        raise
+                    elif current_text_length > 0 or current_child_count > 0:
+                        if not baseline or self._extract_response_text_from_element(
+                            driver, container
+                        ) != baseline:
+                            stable_counter += 1
+                        else:
+                            stable_counter = 0
+                    else:
+                        stable_counter = 0
+                previous_text_length = current_text_length
+                previous_child_count = current_child_count
 
-            # Detect page-level error conditions (rate limit, captcha) so we
-            # can fail fast instead of spinning until the absolute cap.
+                if stable_counter >= 2:
+                    response = self._extract_response_text_from_element(driver, container)
+                    if response:
+                        logger.debug(
+                            "[selenium] watcher detected stable response after %d iterations",
+                            iteration,
+                        )
+                        return response
+
             if self._is_limit_present(driver):
                 raise RuntimeError(
                     "selenium_response_detection_timeout: service limit detected "
@@ -2087,66 +2168,19 @@ class SeleniumLLMBase:
                     "during response wait"
                 )
 
-            # Periodic Phase 2 status log (every 30 s).
-            if time.time() - _last_status_log >= 30.0:
-                _elapsed = time.time() - start
-                _inactivity = time.time() - last_activity
-                cur_snippet = self._get_latest_response_text(driver)
-                logger.info(
-                    "[selenium] Phase 2 status: elapsed=%.1fs inactivity=%.1fs "
-                    "first_new_len=%d generating=%s gen_was_active=%s "
-                    "baseline_snippet=%r cur_snippet=%r",
-                    _elapsed, _inactivity, len(first_new), generating,
-                    self._generation_was_active,
-                    (baseline or "")[:80], (cur_snippet or "")[:80],
-                )
-                _last_status_log = time.time()
+            time.sleep(1.0)
 
-            cur = self._get_latest_response_text(driver)
-            cur_url = ""
-            try:
-                cur_url = driver.current_url or ""
-            except Exception:
-                pass
+        if last_container is not None:
+            result = self._extract_response_text_from_element(driver, last_container)
+        else:
+            result = self._get_latest_response_text(driver)
 
-            if cur and cur != baseline:
-                last_activity = time.time()
-                if first_new == "" or cur != first_new:
-                    first_new = cur
-                    stable_since = time.time()
-                    logger.debug("[selenium] New response candidate captured")
+        if result:
+            logger.warning(
+                "[selenium] Response wait timed out, returning best-effort result"
+            )
+            return result
 
-                if self.service_url and not cur_url.startswith(self.service_url):
-                    logger.warning(
-                        "[selenium] Detected navigation away from service URL; returning captured text"
-                    )
-                    return first_new
-
-                if time.time() - stable_since >= 1.5:
-                    logger.debug("[selenium] Response stable (1.5 s) — done")
-                    return first_new
-            elif first_new:
-                if time.time() - stable_since >= 1.5:
-                    logger.debug("[selenium] First new response stable (1.5 s) — done")
-                    return first_new
-
-            # Fallback: text-stability only.
-            # When the response text has not changed for 2 s and is different
-            # from baseline, the LLM has finished generating.
-            if cur != _fb_last_text:
-                _fb_last_text = cur
-                _fb_stable_since = time.time()
-            elif time.time() - _fb_stable_since >= 2.0:
-                result = cur if (cur and cur != baseline) else first_new
-                if result:
-                    logger.debug("[selenium] Fallback: text stable 1 s — done")
-                    return result
-
-            time.sleep(0.15)
-
-        if first_new:
-            logger.warning("[selenium] Response wait timed out, returning best-effort result")
-            return first_new
         raise RuntimeError(
             "selenium_response_detection_timeout: no new response text appeared "
             "in expected selectors within the allotted time"

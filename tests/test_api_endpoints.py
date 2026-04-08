@@ -1941,6 +1941,86 @@ def test_wait_for_response_returns_best_effort_when_first_new_set(monkeypatch):
     assert result in ("new response text", "")
 
 
+def test_wait_for_response_watcher_stable_container_returns_text(monkeypatch):
+    """_wait_for_response should return text after the generic container watcher sees stability."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.accept_button_selectors = []
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+
+    fake_element = MagicMock()
+    stats = [(0, 0), (5, 1), (5, 1), (5, 1)]
+    call_count = {"n": 0}
+
+    def fake_get_stats(_driver, _element):
+        call_count["n"] += 1
+        return stats[min(call_count["n"] - 1, len(stats) - 1)]
+
+    engine._find_response_container_element = lambda driver: (fake_element, "div.response")
+    engine._get_response_container_stats = fake_get_stats
+    engine._extract_response_text_from_element = lambda driver, element: "final response"
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com"
+
+    with monkeypatch.context() as m:
+        m.setattr("time.sleep", lambda *_: None)
+        result = engine._wait_for_response(mock_driver, max_wait=10)
+
+    assert result == "final response"
+
+
+def test_wait_for_response_watcher_initial_stable_response_returns_text(monkeypatch):
+    """_wait_for_response should return text when the response is already stable on first poll."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.accept_button_selectors = []
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+
+    fake_element = MagicMock()
+    stats = [(5, 1), (5, 1), (5, 1)]
+    call_count = {"n": 0}
+
+    def fake_get_stats(_driver, _element):
+        call_count["n"] += 1
+        return stats[min(call_count["n"] - 1, len(stats) - 1)]
+
+    engine._find_response_container_element = lambda driver: (fake_element, "div.response")
+    engine._get_response_container_stats = fake_get_stats
+    engine._extract_response_text_from_element = lambda driver, element: "final response"
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com"
+
+    with monkeypatch.context() as m:
+        m.setattr("time.sleep", lambda *_: None)
+        result = engine._wait_for_response(mock_driver, max_wait=10)
+
+    assert result == "final response"
+
+
 # ---------------------------------------------------------------------------
 # Prompt chunking tests
 # ---------------------------------------------------------------------------
