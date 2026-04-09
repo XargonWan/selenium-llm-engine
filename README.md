@@ -205,25 +205,6 @@ docker compose up --build
 
 This runs the same service under `http://localhost:14848` (and `http://localhost:3001` for webtop).
 
-## Notes
-
-- Requires Chromium + chromedriver and undetected-chromedriver.
-- Container binds persistent profile path: `/config/.config/chromium-synth`.
-- If using Python locally, a compatible FastAPI/Pydantic stack is required, but this approach is not tested nor supported.
-
-## Legal / Terms of Service (ToS) Notice
-
-- This software is intended for research and testing purposes only.
-- Before using this tool with any online service, verify and comply with that service's Terms of Service (ToS) and usage policies.
-- If the target service does not allow automated access or use via browser automation, do not use this software against it.
-- Always respect copyright and service contract requirements.
-## Development
-
-```bash
-python -m pip install -r requirements.txt
-pytest -q
-```
-
 ## Directory structure
 
 - `app.py` - FastAPI entrypoint
@@ -232,3 +213,10 @@ pytest -q
 - `web/` - minimal static UI
 - `tests/` - API tests
 - `Dockerfile`, `docker-compose.yml` - container setup
+
+## Legal / Terms of Service (ToS) Notice
+
+- This software is intended for research and testing purposes only.
+- Before using this tool with any online service, verify and comply with that service's Terms of Service (ToS) and usage policies.
+- If the target service does not allow automated access or use via browser automation, do not use this software against it.
+- Always respect copyright and service contract requirements.
