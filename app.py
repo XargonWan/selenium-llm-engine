@@ -101,6 +101,15 @@ def _guess_filename(media_type: str, mime_type: str, index: int) -> str:
     return f"{media_type}_{index}{extension}"
 
 
+def _map_media_capabilities_to_model_caps(media_capabilities: list[str]) -> dict[str, bool]:
+    capabilities: dict[str, bool] = {}
+    if "image" in media_capabilities:
+        capabilities["vision"] = True
+    if "audio" in media_capabilities:
+        capabilities["audio"] = True
+    return capabilities
+
+
 def _parse_media_part(part: dict, index: int) -> MediaItem:
     raw_media_type = str(part.get("type", "")).strip()
     if raw_media_type in ("image_url", "image"):
@@ -429,6 +438,9 @@ async def models() -> LegacyModelList:
             "owned_by": "selenium-llm-engine",
             # Legacy extra fields (kept for backward compat)
             "name": engine_name,
+            "capabilities": _map_media_capabilities_to_model_caps(
+                list(desc.get("media_capabilities", []))
+            ),
         }
         # Use live engine data if the browser is already running, otherwise
         # fall back to the descriptor metadata (avoids opening browsers on probe).
@@ -552,6 +564,9 @@ async def v1_models() -> ModelList:
                 object="model",
                 created=created,
                 owned_by="selenium-llm-engine",
+                capabilities=_map_media_capabilities_to_model_caps(
+                    list(desc.get("media_capabilities", []))
+                ),
             )
         )
     return ModelList(object="list", data=entries)

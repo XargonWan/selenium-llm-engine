@@ -53,6 +53,7 @@ class ModelEntry(BaseModel):
     object: str
     created: int
     owned_by: str
+    capabilities: Optional[dict[str, bool]] = None
 
 
 class ModelList(BaseModel):
