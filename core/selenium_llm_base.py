@@ -58,12 +58,14 @@ class SeleniumLLMBase:
         else:
             self.headless = headless
         self._initialized = False
+
         self.profile_dir = profile_dir or os.getenv(
             "CHROMIUM_PROFILE_DIR", "/config/.config/chromium-synth"
         )
-        self._last_login_state: Optional[bool] = None
-
         os.makedirs(self.profile_dir, exist_ok=True)
+        logger.info(f"[selenium] Chrome profile_dir={self.profile_dir}")
+
+        self._last_login_state: Optional[bool] = None
 
         # Selector lists used by _sync_generate_response — override in subclasses.
         self.prompt_area_selectors: list[str] = [
@@ -242,8 +244,6 @@ class SeleniumLLMBase:
             "--disable-web-security",
             "--allow-running-insecure-content",
             "--disable-features=VizDisplayCompositor",
-            "--user-data-dir=%s" % self.profile_dir,
-            "--profile-directory=Default",
             "--remote-debugging-port=0",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
@@ -256,6 +256,7 @@ class SeleniumLLMBase:
             options.add_argument(arg)
 
         options.add_argument("--window-size=1280,900")
+        options.add_argument(f"--user-data-dir={self.profile_dir}")
         return options
 
     def _init_driver(self) -> Any:
@@ -369,13 +370,21 @@ class SeleniumLLMBase:
         try:
             logger.info("[selenium] Cleaning up Chromium remnants...")
 
-            # Kill processes aggressively with -9 (SyntH pattern)
-            for pattern in [
-                "chromium",
-                "chrome",
-                "chromedriver",
-                "undetected_chromedriver",
-            ]:
+            # Kill only processes that are using this engine's profile directory
+            patterns: list[str] = []
+            if self.profile_dir:
+                patterns.append(self.profile_dir)
+            else:
+                patterns.extend(
+                    [
+                        "chromium",
+                        "chrome",
+                        "chromedriver",
+                        "undetected_chromedriver",
+                    ]
+                )
+
+            for pattern in patterns:
                 try:
                     subprocess.run(
                         ["pkill", "-9", "-f", pattern],
