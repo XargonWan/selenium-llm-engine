@@ -1594,6 +1594,15 @@ def test_v1_models_response_schema_fields():
         assert isinstance(entry["created"], int)
 
 
+def test_v1_models_include_capabilities():
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    for entry in data["data"]:
+        assert "capabilities" in entry
+        assert isinstance(entry["capabilities"], dict)
+
+
 def test_legacy_models_response_schema_fields():
     """GET /models entries must have all OpenAI fields plus the legacy 'name' field."""
     response = client.get("/models")
