@@ -112,6 +112,15 @@ def _map_media_capabilities_to_model_caps(media_capabilities: list[str]) -> dict
 
 def _parse_media_part(part: dict, index: int) -> MediaItem:
     raw_media_type = str(part.get("type", "")).strip()
+    if not raw_media_type:
+        mime_type_hint = str(part.get("mime_type") or part.get("content_type") or "").strip().lower()
+        if mime_type_hint.startswith("image/"):
+            raw_media_type = "image"
+        elif mime_type_hint.startswith("audio/"):
+            raw_media_type = "audio"
+        elif mime_type_hint:
+            raw_media_type = "input_file"
+
     if raw_media_type in ("image_url", "image"):
         media_type = "image"
     elif raw_media_type in ("input_audio", "audio"):
@@ -122,7 +131,13 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
         raise HTTPException(status_code=400, detail=f"Unsupported media type: {raw_media_type}")
 
     if media_type == "image":
-        source = part.get("url") or part.get("data")
+        # Support both flat {"url": "..."} and OpenAI vision {"image_url": {"url": "..."}}
+        image_url_nested = part.get("image_url")
+        source = (
+            part.get("url")
+            or part.get("data")
+            or (image_url_nested.get("url") if isinstance(image_url_nested, dict) else None)
+        )
         if not source:
             raise HTTPException(status_code=400, detail="Missing image URL or data")
     else:
@@ -151,6 +166,81 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
     return MediaItem(media_type=media_type, data=data, mime_type=mime_type, filename=filename)
 
 
+def _try_parse_json_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    trimmed = value.strip()
+    if not trimmed or trimmed[0] not in ("{", "["):
+        return value
+    try:
+        parsed = json.loads(trimmed)
+        logger.debug("[selenium] Parsed JSON string content into structured payload")
+        return parsed
+    except Exception:
+        return value
+
+
+def _is_media_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    raw_media_type = str(part.get("type", "")).strip().lower()
+    if raw_media_type in (
+        "image_url",
+        "image",
+        "input_audio",
+        "audio",
+        "input_file",
+        "file",
+        "document",
+        "input_document",
+    ):
+        return True
+    mime_type = str(part.get("mime_type") or part.get("content_type") or "").strip().lower()
+    return bool(mime_type and (mime_type.startswith("image/") or mime_type.startswith("audio/") or mime_type.startswith("video/") or mime_type.startswith("application/")))
+
+
+def _extract_text_and_media(content: Any, media_items: list[MediaItem]) -> str:
+    content = _try_parse_json_string(content)
+    if isinstance(content, dict):
+        if _is_media_part(content):
+            try:
+                media_items.append(_parse_media_part(content, len(media_items)))
+                logger.debug("[selenium] Extracted media part from structured payload")
+            except HTTPException:
+                pass
+            return ""
+
+        text_parts: list[str] = []
+        attachments = content.get("attachments")
+        if isinstance(attachments, list):
+            for attachment in attachments:
+                if _is_media_part(attachment):
+                    try:
+                        media_items.append(_parse_media_part(attachment, len(media_items)))
+                        logger.debug("[selenium] Extracted media attachment from attachments array")
+                    except HTTPException:
+                        pass
+                else:
+                    text_parts.append(_extract_text_and_media(attachment, media_items))
+
+        if "content" in content:
+            text_parts.append(_extract_text_and_media(content["content"], media_items))
+        if "text" in content and content["text"] is not content.get("content"):
+            text_parts.append(_extract_text_and_media(content["text"], media_items))
+
+        for key, value in content.items():
+            if key in ("type", "attachments", "content", "text"):
+                continue
+            text_parts.append(_extract_text_and_media(value, media_items))
+
+        return "".join(text_parts)
+
+    if isinstance(content, list):
+        return "".join(_extract_text_and_media(item, media_items) for item in content)
+
+    return str(content)
+
+
 def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
     prompt_text = ""
     media_items: list[MediaItem] = []
@@ -168,26 +258,7 @@ def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
                 role = str(message.get("role", "user"))
                 content = message.get("content", "")
 
-            message_text = ""
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") in (
-                        "text",
-                        "image_url",
-                        "image",
-                        "input_audio",
-                        "audio",
-                        "input_file",
-                        "file",
-                    ):
-                        if part.get("type") == "text":
-                            message_text += str(part.get("content", ""))
-                        else:
-                            media_items.append(_parse_media_part(part, len(media_items)))
-                    else:
-                        message_text += str(part)
-            else:
-                message_text = str(content)
+            message_text = _extract_text_and_media(content, media_items)
 
             if role == "system":
                 if message_text:
@@ -203,7 +274,7 @@ def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
             parts.extend(user_parts)
         prompt_text = "\n\n".join(parts)
     else:
-        prompt_text = str(payload)
+        prompt_text = _extract_text_and_media(payload, media_items)
 
     if not prompt_text and media_items:
         prompt_text = "[Media attachments included]"

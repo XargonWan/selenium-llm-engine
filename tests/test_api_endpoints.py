@@ -144,6 +144,54 @@ def test_parse_media_part_accepts_generic_file():
     assert item.data == b"foobar"
 
 
+def test_parse_media_part_openai_image_url_format():
+    """image_url payload with nested {'image_url': {'url': '...'}} must be parsed."""
+    from app import _parse_media_part
+
+    image_data = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAA"
+        "AAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+    )
+    part = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+    }
+    item = _parse_media_part(part, 0)
+    assert item.media_type == "image"
+    assert item.mime_type == "image/png"
+
+
+def test_multimodal_openai_vision_format():
+    """End-to-end: OpenAI vision format {'image_url': {'url': 'data:...'}} reaches the engine."""
+    image_data = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAA"
+        "AAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "content": "Describe this image:"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    engine = EngineManager.get().engines["chatgpt"]
+    assert len(engine.last_media) == 1
+    assert engine.last_media[0].media_type == "image"
+    assert engine.last_media[0].mime_type == "image/png"
+
+
 def test_normalize_prompt_payload_includes_input_file():
     from app import _normalize_prompt_payload
 
@@ -244,6 +292,43 @@ def test_multimodal_text_and_image():
     engine = EngineManager.get().engines["chatgpt"]
     assert len(engine.last_media) == 1
     assert engine.last_media[0].media_type == "image"
+
+
+def test_multimodal_text_and_image_json_string_content():
+    image_data = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAA"
+        "AAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+    )
+    payload = {
+        "model": "chatgpt",
+        "messages": [
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "type": "text",
+                        "content": "Here is an image:",
+                        "attachments": [
+                            {
+                                "mime_type": "image/png",
+                                "data": f"data:image/png;base64,{image_data}",
+                                "filename": "test.png",
+                            }
+                        ],
+                    }
+                ),
+            }
+        ],
+    }
+
+    response = client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "chat.completion"
+    engine = EngineManager.get().engines["chatgpt"]
+    assert len(engine.last_media) == 1
+    assert engine.last_media[0].media_type == "image"
+    assert engine.last_media[0].filename == "test.png"
 
 
 def test_prompt_unknown_engine():
