@@ -6,6 +6,7 @@ import mimetypes
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Set
@@ -16,6 +17,8 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+
+
 
 from db.db import (
     clear_prompt_logs,
@@ -290,7 +293,26 @@ logging.getLogger().addHandler(_buf_handler)
 
 logger = logging.getLogger("selenium-llm-api")
 
-app = FastAPI(title="Selenium LLM Engine", version="0.1")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
+    # ---- startup ----
+    init_database()
+    EngineManager.get()           # initialize manager
+    _register_engine_routes(app)  # dynamic per-engine /name/prompt routes
+    yield
+    # ---- shutdown ----
+    # Gracefully quit all Chrome instances so they can flush cookies/profile to
+    # disk before the container is killed.  This keeps login sessions alive
+    # across docker stop / docker restart.
+    try:
+        manager = EngineManager.get()
+        await asyncio.wait_for(manager.stop_all(), timeout=15)
+    except Exception as exc:
+        logger.warning(f"[shutdown] stop_all error: {exc}")
+
+
+app = FastAPI(title="Selenium LLM Engine", version="0.1", lifespan=_lifespan)
 
 # Rate limiting (per ip, sliding window)
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -401,11 +423,7 @@ def _openai_chunk(
     return f"data: {json.dumps(payload)}\n\n"
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    init_database()
-    EngineManager.get()  # initialize manager
-    _register_engine_routes(app)  # dynamic per-engine /name/prompt routes
+
 
 
 @app.get("/")

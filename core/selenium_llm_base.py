@@ -244,7 +244,6 @@ class SeleniumLLMBase:
             "--disable-web-security",
             "--allow-running-insecure-content",
             "--disable-features=VizDisplayCompositor",
-            "--remote-debugging-port=0",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
@@ -386,6 +385,22 @@ class SeleniumLLMBase:
 
             for pattern in patterns:
                 try:
+                    # Graceful shutdown: SIGTERM first so Chrome can flush cookies/profile to disk
+                    subprocess.run(
+                        ["pkill", "-15", "-f", pattern],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
+
+            # Give Chrome time to flush profile (cookies, session storage) before SIGKILL
+            time.sleep(1.5)
+
+            for pattern in patterns:
+                try:
+                    # SIGKILL fallback for any stragglers that ignored SIGTERM
                     subprocess.run(
                         ["pkill", "-9", "-f", pattern],
                         check=False,
@@ -395,8 +410,8 @@ class SeleniumLLMBase:
                 except Exception:
                     pass
 
-            # Wait for processes to terminate
-            time.sleep(2)
+            # Brief wait after SIGKILL before removing lock files
+            time.sleep(0.5)
             logger.info("[selenium] Chromium processes killed")
 
             # Clean up temp dir lock files
@@ -2102,7 +2117,6 @@ class SeleniumLLMBase:
         previous_child_count = -1
         stable_counter = 0
         iteration = 0
-        generated_activity = False
         last_container = None
 
         while time.time() < deadline:
@@ -2142,7 +2156,6 @@ class SeleniumLLMBase:
                         current_text_length != previous_text_length
                         or current_child_count != previous_child_count
                     ):
-                        generated_activity = True
                         stable_counter = 0
                         self._generation_was_active = True
                     elif current_text_length > 0 or current_child_count > 0:
@@ -2235,6 +2248,9 @@ class SeleniumLLMBase:
                     self.driver.quit()
                 except Exception as e:
                     logger.warning(f"[selenium] driver.quit() error: {e}")
+                    # Give Chrome a moment to complete any pending profile writes
+                    # before the forceful pkill in _cleanup_chromium_remnants.
+                    time.sleep(1)
             self._cleanup_chromium_remnants()
 
         try:
