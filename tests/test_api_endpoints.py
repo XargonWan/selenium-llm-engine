@@ -1003,6 +1003,8 @@ def test_fill_input_contenteditable_triggers_extra_keystroke():
             self.script_calls.append((script, args))
             if "document.execCommand('insertText'" in script:
                 return None
+            if "const text = el.innerText" in script:
+                return "test"
             return None
 
     engine = SeleniumLLMBase(
@@ -1021,6 +1023,82 @@ def test_fill_input_contenteditable_triggers_extra_keystroke():
     )
     assert ("send_keys", (Keys.SPACE, Keys.BACKSPACE)) in events
 
+
+def test_fill_input_verifies_input_value_for_textarea():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    class FakeElement:
+        tag_name = "textarea"
+
+        def __init__(self):
+            self.value = ""
+
+        def click(self):
+            pass
+
+        def clear(self):
+            self.value = ""
+
+        def send_keys(self, text):
+            self.value = text
+
+        def get_attribute(self, name):
+            if name == "value":
+                return self.value
+            return None
+
+    class FakeDriver:
+        def execute_script(self, script, *args):
+            return None
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine._ensure_ready = lambda: None
+    engine.driver = FakeDriver()
+
+    fake_el = FakeElement()
+    engine._fill_input(engine.driver, fake_el, "hello world")
+    assert fake_el.get_attribute("value") == "hello world"
+
+
+def test_fill_input_raises_when_verification_fails():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    class FakeElement:
+        tag_name = "textarea"
+
+        def click(self):
+            pass
+
+        def clear(self):
+            pass
+
+        def send_keys(self, text):
+            pass
+
+        def get_attribute(self, name):
+            if name == "value":
+                return "wrong text"
+            return None
+
+    class FakeDriver:
+        def execute_script(self, script, *args):
+            return None
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine._ensure_ready = lambda: None
+    engine.driver = FakeDriver()
+
+    fake_el = FakeElement()
+    with pytest.raises(RuntimeError, match="fill_input verification failed"):
+        engine._fill_input(engine.driver, fake_el, "hello world")
 
 
 def test_v1_models_unknown():
@@ -1404,15 +1482,35 @@ def test_fill_input_retries_on_stale_element():
         default_model="default",
     )
     first_input = MagicMock()
-    second_input = MagicMock()
     first_input.tag_name = "textarea"
-    second_input.tag_name = "textarea"
     first_input.click.side_effect = StaleElementReferenceException("stale")
     first_input.clear.side_effect = StaleElementReferenceException("stale")
-    second_input.click.return_value = None
-    second_input.clear.return_value = None
-    second_input.send_keys.return_value = None
-    second_input.tag_name = "textarea"
+
+    class FakeTextarea:
+        tag_name = "textarea"
+
+        def __init__(self):
+            self._value = ""
+            self.clear_called = False
+            self.send_keys_called = False
+
+        def click(self):
+            return None
+
+        def clear(self):
+            self.clear_called = True
+            self._value = ""
+
+        def send_keys(self, text):
+            self.send_keys_called = True
+            self._value = text
+
+        def get_attribute(self, name):
+            if name == "value":
+                return self._value
+            return None
+
+    second_input = FakeTextarea()
 
     def find_input(driver, selectors, timeout, cache_attr=None):
         return second_input
@@ -1421,8 +1519,9 @@ def test_fill_input_retries_on_stale_element():
 
     base._fill_input(MagicMock(), first_input, "hello world")
 
-    assert second_input.clear.called
-    assert second_input.send_keys.called
+    assert second_input.clear_called
+    assert second_input.send_keys_called
+    assert second_input._value == "hello world"
 
 
 def test_wait_for_send_button_after_media_upload_returns_true_when_button_appears():
@@ -2622,3 +2721,170 @@ def test_wait_for_response_initial_phase_fallback_send_button_absent():
         result = engine._wait_for_response(mock_driver, max_wait=10)
 
     assert result == response_text
+
+
+# ---------------------------------------------------------------------------
+# Cookie persistence tests
+# ---------------------------------------------------------------------------
+
+
+def test_save_cookies_writes_json(tmp_path):
+    """_save_cookies writes a JSON file with the driver's cookies."""
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.ENGINE_NAME = "test-engine"
+    engine.driver = MagicMock()
+    engine.driver.get_cookies.return_value = [
+        {"name": "sid", "value": "abc123", "domain": ".example.com"},
+    ]
+
+    engine._save_cookies()
+
+    cookie_file = tmp_path / "cookies_test-engine.json"
+    assert cookie_file.exists()
+    data = json.loads(cookie_file.read_text())
+    assert len(data) == 1
+    assert data[0]["name"] == "sid"
+
+
+def test_save_cookies_noop_without_driver(tmp_path):
+    """_save_cookies does nothing when driver is None."""
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.ENGINE_NAME = "test-engine"
+    engine.driver = None
+
+    engine._save_cookies()
+
+    cookie_file = tmp_path / "cookies_test-engine.json"
+    assert not cookie_file.exists()
+
+
+def test_restore_cookies_loads_json(tmp_path):
+    """_restore_cookies loads cookies from a JSON file into the driver."""
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.ENGINE_NAME = "test-engine"
+    engine.driver = MagicMock()
+
+    cookie_file = tmp_path / "cookies_test-engine.json"
+    cookie_file.write_text(json.dumps([
+        {"name": "sid", "value": "abc123", "domain": ".example.com"},
+    ]))
+
+    engine._restore_cookies()
+
+    engine.driver.get.assert_called_once_with("https://example.com")
+    engine.driver.add_cookie.assert_called_once()
+    added = engine.driver.add_cookie.call_args[0][0]
+    assert added["name"] == "sid"
+    engine.driver.refresh.assert_called_once()
+
+
+def test_restore_cookies_noop_when_file_missing(tmp_path):
+    """_restore_cookies does nothing when the cookie file doesn't exist."""
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.ENGINE_NAME = "test-engine"
+    engine.driver = MagicMock()
+
+    engine._restore_cookies()
+
+    engine.driver.add_cookie.assert_not_called()
+
+
+def test_maybe_save_cookies_respects_interval(tmp_path):
+    """_maybe_save_cookies only saves when the interval has elapsed."""
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.ENGINE_NAME = "test-engine"
+    engine.driver = MagicMock()
+    engine.driver.get_cookies.return_value = [{"name": "a", "value": "b"}]
+
+    # First call should save (last save is 0).
+    engine._maybe_save_cookies()
+    assert (tmp_path / "cookies_test-engine.json").exists()
+
+    # Immediately calling again should NOT save (interval not elapsed).
+    engine.driver.get_cookies.reset_mock()
+    engine._cookie_save_interval = 9999
+    engine._maybe_save_cookies()
+    engine.driver.get_cookies.assert_not_called()
+
+
+def test_cookie_path_uses_engine_name(tmp_path):
+    """_cookie_path includes ENGINE_NAME in the filename."""
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.ENGINE_NAME = "my-engine"
+    assert engine._cookie_path().endswith("cookies_my-engine.json")
+
+
+def test_cookie_path_default_without_engine_name(tmp_path):
+    """_cookie_path falls back to 'default' when ENGINE_NAME is not set."""
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    assert engine._cookie_path().endswith("cookies_default.json")
+
+
+def test_build_options_includes_restore_session():
+    """_build_options adds --restore-last-session and session prefs."""
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    options = engine._build_options()
+    args = options.arguments
+    assert "--restore-last-session" in args
+    prefs = options.experimental_options.get("prefs", {})
+    assert prefs.get("profile.exit_type") == "Normal"
+    assert prefs.get("profile.exited_cleanly") is True

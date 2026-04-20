@@ -546,8 +546,12 @@ class EngineManager:
     # ---------------------------------------------------------------------- lifecycle
 
     async def stop_all(self) -> None:
+        """Save cookies for every engine, then quit the shared Chrome driver."""
         for engine in self.engines.values():
             try:
                 await engine.stop()
             except Exception:
                 pass
+        # Actually terminate the shared browser now that all engines detached.
+        from core.selenium_llm_base import shutdown_shared_driver
+        shutdown_shared_driver()

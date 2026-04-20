@@ -30,6 +30,52 @@ logger = logging.getLogger("selenium_llm_base")
 # other's browsers when multiple engines are started simultaneously.
 _CHROMIUM_INIT_LOCK = threading.Lock()
 
+# Shared Chrome driver instance — all engine instances reuse the same browser
+# to avoid profile-dir lock conflicts and preserve login sessions across engines.
+_shared_driver: Optional[Any] = None
+
+
+def shutdown_shared_driver() -> None:
+    """Quit the shared Chrome driver and clean up all Chromium processes.
+
+    Called once by :meth:`EngineManager.stop_all` during application shutdown.
+    """
+    global _shared_driver
+    with _CHROMIUM_INIT_LOCK:
+        drv = _shared_driver
+        _shared_driver = None
+    if drv is not None:
+        try:
+            drv.quit()
+        except Exception as exc:
+            logger.warning("[selenium] shared driver quit error: %s", exc)
+            time.sleep(1)
+    # Kill any remaining Chromium processes and remove lock files.
+    profile_dir = os.getenv(
+        "CHROMIUM_PROFILE_DIR", "/config/.config/chromium-synth"
+    )
+    patterns = [profile_dir] if profile_dir else [
+        "chromium", "chrome", "chromedriver", "undetected_chromedriver",
+    ]
+    for pattern in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-15", "-f", pattern],
+                check=False, capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+    time.sleep(3)
+    for pattern in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                check=False, capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+    logger.info("[selenium] Shared driver shut down")
+
 
 class SeleniumLLMBase:
     def __init__(
@@ -121,6 +167,22 @@ class SeleniumLLMBase:
         # Some engines (Gemini) work more reliably when response detection uses
         # stable text instead of comparing against prior baseline text.
         self._use_baseline_comparison: bool = True
+
+        # Timestamp of the last cookie save — used to rate-limit periodic saves.
+        self._last_cookie_save: float = 0.0
+        # Minimum interval (seconds) between periodic cookie saves.
+        self._cookie_save_interval: int = int(os.getenv("COOKIE_SAVE_INTERVAL", "300"))
+
+        # Whether this instance has already restored its cookies into the
+        # shared driver.  Reset on stop/reset so a fresh restore happens
+        # on the next use.
+        self._cookies_restored: bool = False
+
+        # Optional prefix prepended to the prompt when media items are present.
+        # Useful to prevent engines that run inside an existing chat context
+        # (e.g. Gemini Web with SyntH persona) from responding in their
+        # trained JSON/action schema instead of plain descriptive text.
+        self._vision_prompt_prefix: str = ""
 
     def get_supported_models(self) -> list[str]:
         return list(self.model_limits_map.keys())
@@ -247,6 +309,7 @@ class SeleniumLLMBase:
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
+            "--restore-last-session",
         ]
         if self.headless:
             essential_args.append("--headless=new")
@@ -256,10 +319,24 @@ class SeleniumLLMBase:
 
         options.add_argument("--window-size=1280,900")
         options.add_argument(f"--user-data-dir={self.profile_dir}")
+
+        # Tell Chrome the previous session ended cleanly so it restores
+        # session cookies and skips the "restore pages?" dialog.
+        options.add_experimental_option("prefs", {
+            "profile.exit_type": "Normal",
+            "profile.exited_cleanly": True,
+        })
         return options
 
     def _init_driver(self) -> Any:
-        """Initialize Chrome driver using the same approach as SyntH's _create_shared_driver."""
+        """Initialize or reuse the shared Chrome driver.
+
+        All engine instances share a single Chrome process to prevent
+        profile-dir lock conflicts and to stop ``_cleanup_chromium_remnants``
+        from killing another engine's browser (and its login session).
+        """
+        global _shared_driver
+
         if self.driver is not None:  # fast path — no lock needed
             return self.driver
 
@@ -268,6 +345,21 @@ class SeleniumLLMBase:
             if self.driver is not None:
                 return self.driver
 
+            # ---- reuse existing shared driver if alive ----
+            if _shared_driver is not None:
+                try:
+                    _ = _shared_driver.current_url  # ping — throws if dead
+                    self.driver = _shared_driver
+                    self._initialized = True
+                    logger.info("[selenium] Reusing shared Chrome driver")
+                    return self.driver
+                except Exception:
+                    logger.warning(
+                        "[selenium] Shared driver is dead, creating a new one"
+                    )
+                    _shared_driver = None
+
+            # ---- create a fresh driver ----
             logger.info("[selenium] Initializing Chrome driver...")
             self._cleanup_chromium_remnants()
 
@@ -361,7 +453,8 @@ class SeleniumLLMBase:
             self.driver.set_page_load_timeout(120)
             self.driver.set_script_timeout(120)
             self._initialized = True
-            logger.info("[selenium] Driver initialized successfully")
+            _shared_driver = self.driver
+            logger.info("[selenium] Driver initialized successfully (shared)")
             return self.driver
 
     def _cleanup_chromium_remnants(self) -> None:
@@ -396,7 +489,7 @@ class SeleniumLLMBase:
                     pass
 
             # Give Chrome time to flush profile (cookies, session storage) before SIGKILL
-            time.sleep(1.5)
+            time.sleep(3)
 
             for pattern in patterns:
                 try:
@@ -455,9 +548,86 @@ class SeleniumLLMBase:
         except Exception as e:
             logger.warning(f"[selenium] Error during Chromium cleanup: {e}")
 
+    # ------------------------------------------------------------------ cookie persistence
+
+    def _cookie_path(self) -> str:
+        """Return the file path for persisted cookies of this engine."""
+        engine_name = getattr(self, "ENGINE_NAME", "default")
+        return os.path.join(self.profile_dir, f"cookies_{engine_name}.json")
+
+    def _save_cookies(self) -> None:
+        """Persist current browser cookies to a JSON file (atomic write)."""
+        if self.driver is None:
+            return
+        try:
+            cookies = self.driver.get_cookies()
+            if not cookies:
+                return
+            path = self._cookie_path()
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(cookies, fh)
+            os.replace(tmp_path, path)
+            self._last_cookie_save = time.time()
+            logger.info(
+                "[selenium] Saved %d cookies to %s", len(cookies), path
+            )
+        except Exception as exc:
+            logger.warning("[selenium] Failed to save cookies: %s", exc)
+
+    def _restore_cookies(self) -> None:
+        """Load previously saved cookies into the browser session."""
+        path = self._cookie_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cookies = json.load(fh)
+            if not isinstance(cookies, list) or not cookies:
+                return
+
+            # Navigate to the service domain so cookies can be set on it.
+            assert self.driver is not None
+            self.driver.get(self.service_url)
+            time.sleep(1)
+
+            restored = 0
+            for cookie in cookies:
+                # Remove fields that Selenium rejects on add_cookie.
+                for key in ("sameSite", "httpOnly", "expiry"):
+                    cookie.pop(key, None)
+                try:
+                    self.driver.add_cookie(cookie)
+                    restored += 1
+                except Exception:
+                    pass  # skip individual cookie errors
+
+            if restored:
+                logger.info(
+                    "[selenium] Restored %d/%d cookies from %s",
+                    restored,
+                    len(cookies),
+                    path,
+                )
+                self.driver.refresh()
+                time.sleep(2)
+        except Exception as exc:
+            logger.warning("[selenium] Failed to restore cookies: %s", exc)
+
+    def _maybe_save_cookies(self) -> None:
+        """Save cookies if enough time has passed since the last save."""
+        if time.time() - self._last_cookie_save >= self._cookie_save_interval:
+            self._save_cookies()
+
+    # ------------------------------------------------------------------ readiness
+
     def _ensure_ready(self) -> None:
         if not self._initialized or self.driver is None:
             self._init_driver()
+        # Restore this engine's cookies once per session (per-domain).
+        if not self._cookies_restored:
+            self._restore_cookies()
+            self._cookies_restored = True
 
     def _ensure_logged_in(self, driver) -> bool:
         # Implemented by subclasses.
@@ -473,6 +643,9 @@ class SeleniumLLMBase:
         try:
             logged = self._ensure_logged_in(self.driver)
             self._last_login_state = logged
+            # Persist cookies every time we detect a logged-in state.
+            if logged:
+                self._maybe_save_cookies()
             return logged
         except Exception as e:
             logger.warning(f"Unable to determine login state: {e}")
@@ -520,7 +693,14 @@ class SeleniumLLMBase:
         All Selenium calls are executed in a thread pool via asyncio.to_thread
         so that blocking I/O never stalls the FastAPI event loop.
         """
-        return await asyncio.to_thread(self._sync_generate_response, prompt, media)
+        result = await asyncio.to_thread(self._sync_generate_response, prompt, media)
+        # Periodically persist cookies after a successful prompt so that login
+        # state survives even if the container is killed abruptly.
+        try:
+            self._maybe_save_cookies()
+        except Exception:
+            pass
+        return result
 
     # ------------------------------------------------------------------ session health
 
@@ -553,6 +733,7 @@ class SeleniumLLMBase:
 
     def _reset_driver(self) -> None:
         """Kill the existing (dead) driver and reset state so _ensure_ready re-inits."""
+        global _shared_driver
         logger.warning("[selenium] Resetting dead driver session…")
         if self.driver is not None:
             try:
@@ -560,7 +741,9 @@ class SeleniumLLMBase:
             except Exception:
                 pass
             self.driver = None
+        _shared_driver = None  # force all engines to re-create on next use
         self._initialized = False
+        self._cookies_restored = False
         self._cleanup_chromium_remnants()
 
     def _is_captcha_present(self, driver: Any) -> bool:
@@ -877,6 +1060,10 @@ class SeleniumLLMBase:
                     "⚠️ Media upload failed. "
                     "Please verify the file and try again."
                 )
+            # When a vision prompt prefix is configured, prepend it so the engine
+            # responds in plain text rather than the trained JSON/action schema.
+            if self._vision_prompt_prefix:
+                prompt = self._vision_prompt_prefix + prompt
 
         # Prompt chunking: split oversized prompts into sequential parts.
         if not self._skip_split_for_next and not media and self._should_split_prompt(prompt):
@@ -1729,6 +1916,42 @@ class SeleniumLLMBase:
         logger.warning("[selenium] No interactable element found")
         return None
 
+    def _normalize_input_text(self, text: str) -> str:
+        return " ".join(text.replace("\r\n", "\n").strip().split())
+
+    def _get_input_text(self, driver: Any, element: Any) -> str:
+        try:
+            tag = (element.tag_name or "").lower()
+            if tag in ("textarea", "input"):
+                return str(element.get_attribute("value") or "")
+            actual = driver.execute_script(
+                "const el = arguments[0];"
+                "if (el.value !== undefined) return el.value || '';"
+                "const text = el.innerText || el.textContent || '';"
+                "return text;",
+                element,
+            )
+            return str(actual or "")
+        except Exception:
+            return ""
+
+    def _verify_input_text(self, driver: Any, element: Any, expected: str) -> bool:
+        expected_norm = self._normalize_input_text(expected)
+        end_time = time.time() + 1.0
+        actual = ""
+        while time.time() < end_time:
+            actual = self._get_input_text(driver, element)
+            if self._normalize_input_text(actual) == expected_norm:
+                return True
+            time.sleep(0.1)
+        logger.warning(
+            "[selenium] fill_input verification failed: expected %s chars, got %s chars",
+            len(expected_norm),
+            len(self._normalize_input_text(actual)),
+        )
+        logger.debug("[selenium] fill_input actual content=%r", actual)
+        return False
+
     def _fill_input(self, driver: Any, element: Any, text: str) -> None:
         """Type *text* into a textarea or contenteditable element."""
         attempts = 0
@@ -1753,11 +1976,15 @@ class SeleniumLLMBase:
                     # Standard form inputs: clear via clear() then type
                     try:
                         element.clear()
-                    except Exception:
+                    except Exception as exc:
+                        if isinstance(exc, StaleElementReferenceException):
+                            raise
                         try:
                             element.send_keys(Keys.CONTROL + "a")
                             element.send_keys(Keys.DELETE)
-                        except Exception:
+                        except Exception as exc2:
+                            if isinstance(exc2, StaleElementReferenceException):
+                                raise
                             pass
                     element.send_keys(text)
                 else:
@@ -1782,6 +2009,8 @@ class SeleniumLLMBase:
                             time.sleep(0.05)
                             element.send_keys(text)
                         except Exception as e:
+                            if isinstance(e, StaleElementReferenceException):
+                                raise
                             logger.error(f"[selenium] fill_input send_keys failed: {e}")
                             raise
                     else:
@@ -1808,6 +2037,10 @@ class SeleniumLLMBase:
                 except Exception:
                     pass
                 logger.debug(f"[selenium] Filled input ({len(text)} chars)")
+                if not self._verify_input_text(driver, element, text):
+                    raise RuntimeError(
+                        "[selenium] fill_input verification failed: prompt content did not match expected text"
+                    )
                 return
             except StaleElementReferenceException as exc:
                 attempts += 1
@@ -2240,26 +2473,24 @@ class SeleniumLLMBase:
     # ------------------------------------------------------------------ /helpers
 
     async def stop(self) -> None:
-        """Quit the driver and clean up."""
+        """Detach from the shared driver and persist cookies.
+
+        The shared Chrome process is **not** quit here — other engines may
+        still need it.  Call :func:`shutdown_shared_driver` (via
+        ``EngineManager.stop_all``) to actually terminate Chrome.
+        """
 
         def _sync_stop() -> None:
             if self.driver is not None:
-                try:
-                    self.driver.quit()
-                except Exception as e:
-                    logger.warning(f"[selenium] driver.quit() error: {e}")
-                    # Give Chrome a moment to complete any pending profile writes
-                    # before the forceful pkill in _cleanup_chromium_remnants.
-                    time.sleep(1)
-            self._cleanup_chromium_remnants()
+                self._save_cookies()
 
         try:
             await asyncio.wait_for(asyncio.to_thread(_sync_stop), timeout=10)
         except TimeoutError:
-            logger.warning("[selenium] stop() timed out — force-cleaning remnants")
-            self._cleanup_chromium_remnants()
+            logger.warning("[selenium] stop() cookie-save timed out")
         except Exception as e:
             logger.warning(f"[selenium] stop() error: {e}")
         finally:
             self.driver = None
             self._initialized = False
+            self._cookies_restored = False

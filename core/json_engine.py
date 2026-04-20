@@ -140,6 +140,8 @@ class JsonEngine(SeleniumLLMBase):
             self._response_max_wait = int(config["response_max_wait"])
         if "use_baseline_comparison" in config:
             self._use_baseline_comparison = bool(config["use_baseline_comparison"])
+        if "vision_prompt_prefix" in config:
+            self._vision_prompt_prefix = str(config["vision_prompt_prefix"])
 
         # ------------------------------------------------------------------ media support
         self.media_config: dict[str, Any] = config.get("media_support", {})
