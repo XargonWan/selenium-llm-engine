@@ -31,6 +31,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -302,6 +303,7 @@ class _PromptJob:
     prompt: str
     future: asyncio.Future  # type: ignore[type-arg]
     media: list[Any] = field(default_factory=list)
+    timeout: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +445,10 @@ class EngineManager:
         ``max_workers`` from the descriptor controls the pool size.  With the
         default value of 1 the engine is fully serial: requests are processed
         one at a time in FIFO order.
+
+        Additionally detects workers that have been stuck on a single job
+        for longer than a safety threshold and cancels them so a fresh
+        worker can take over.
         """
         desc = self._descriptors.get(canonical)
         target = max(1, desc.max_workers if desc else 1)
@@ -450,6 +456,27 @@ class EngineManager:
         existing = self._queue_workers.get(canonical, [])
         # Prune finished workers before counting live ones
         alive = [t for t in existing if not t.done()]
+
+        # Detect stuck workers: if a worker has been processing a single job
+        # for longer than the stuck threshold, cancel it.
+        # Threshold = SELENIUM_TOTAL_TIMEOUT + 30s grace (default 330s).
+        stuck_timeout = int(
+            __import__("os").getenv("SELENIUM_WORKER_STUCK_TIMEOUT", "330")
+        )
+        still_alive: list[asyncio.Task] = []  # type: ignore[type-arg]
+        for t in alive:
+            started = getattr(t, "_job_started_at", None)
+            if started is not None and (_time.time() - started) > stuck_timeout:
+                logger.warning(
+                    "[engine_manager] Worker for '%s' stuck for >%ds, cancelling",
+                    canonical,
+                    stuck_timeout,
+                )
+                t.cancel()
+            else:
+                still_alive.append(t)
+        alive = still_alive
+
         self._queue_workers[canonical] = alive
 
         needed = target - len(alive)
@@ -460,10 +487,14 @@ class EngineManager:
     async def _queue_worker_loop(self, engine_name: str) -> None:
         """Coroutine that processes prompt jobs for *engine_name* sequentially."""
         queue = self._get_or_create_queue(engine_name)
+        current_task = asyncio.current_task()
         while True:
             job = await queue.get()
             queued_at = getattr(job, "_queued_at", None)
-            worker_start = __import__("time").time()
+            worker_start = _time.time()
+            # Tag the task with the job-start timestamp for stuck detection.
+            if current_task is not None:
+                current_task._job_started_at = worker_start  # type: ignore[attr-defined]
             if queued_at is not None:
                 logger.info(
                     f"[timing] queue_wait ({engine_name}): "
@@ -473,11 +504,13 @@ class EngineManager:
                 engine = self.get_engine(engine_name)  # lazy-init browser here
                 self.active_engine = engine
                 try:
-                    result_text = await engine.generate_response(job.prompt, job.media)
+                    result_text = await engine.generate_response(
+                        job.prompt, job.media, timeout=job.timeout,
+                    )
                 except TypeError:
                     result_text = await engine.generate_response(job.prompt)
                 model_name = engine.get_current_model()
-                elapsed = __import__("time").time() - worker_start
+                elapsed = _time.time() - worker_start
                 logger.info(
                     f"[timing] worker_total ({engine_name}): {elapsed:.2f}s"
                 )
@@ -492,25 +525,37 @@ class EngineManager:
                     job.future.set_exception(exc)
             finally:
                 queue.task_done()
+                # Clear the job-start marker so stuck detection doesn't
+                # trigger while the worker is idle waiting for the next job.
+                if current_task is not None:
+                    current_task._job_started_at = None  # type: ignore[attr-defined]
 
     async def enqueue(
         self,
         engine_name: str,
         prompt: str,
         media: list[Any] | None = None,
+        timeout: int | None = None,
     ) -> _PromptResult:
         """Submit *prompt* and optional media to the named engine's FIFO queue.
 
         The engine browser is started lazily by the worker, not by the HTTP
         handler.  Concurrent callers on the same engine are serialised
         automatically (max_workers=1 default).
+
+        Parameters
+        ----------
+        timeout:
+            Per-request total timeout in seconds.  Passed through to
+            ``engine.generate_response()``.  ``None`` means use the
+            engine/environment default (300 s).
         """
         canonical = self._resolve(engine_name)
         queue = self._get_or_create_queue(canonical)
         loop = asyncio.get_event_loop()
         future: asyncio.Future[_PromptResult] = loop.create_future()
-        job = _PromptJob(prompt=prompt, future=future, media=media or [])
-        job._queued_at = __import__("time").time()  # type: ignore[attr-defined]
+        job = _PromptJob(prompt=prompt, future=future, media=media or [], timeout=timeout)
+        job._queued_at = _time.time()  # type: ignore[attr-defined]
         self._ensure_workers(canonical)
         await queue.put(job)
         return await future

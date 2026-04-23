@@ -35,6 +35,7 @@ Feel free to submit pull requests with improvements, new engines, or engine defi
   - `/api/logs/app` (incremental app log polling)
   - `/api/engines/selector-hints` (runtime selector hints)
   - `/reset` and `/api/reset` (clears engine state and stats counters)
+  - `/api/session/kill` (force-kills frozen browser session processes)
   - `/logs` and `/api/history`
   - `/ui`
 - SQLite storage for prompt logs and counters

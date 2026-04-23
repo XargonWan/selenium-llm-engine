@@ -4,7 +4,7 @@
   "aliases": ["gemini", "google"],
   "service_url": "https://gemini.google.com",
   "default_model": "2.5-flash",
-  "response_max_wait": 80,
+  "response_max_wait": 60,
   "use_baseline_comparison": false,
   "allow_unlogged": true,
   "models": {
@@ -19,21 +19,39 @@
     "prompt_area": [
       "div[contenteditable='true'][data-placeholder]",
       "div[contenteditable='true'][aria-label*='Ask']",
+      "div[contenteditable='true'][aria-label*='Chiedi']",
       "div[contenteditable='true'][aria-label*='Message']",
+      "div[contenteditable='true'][aria-label*='Messaggio']",
       "div[contenteditable='true'][aria-label*='Enter']",
+      "div[contenteditable='true'][aria-label*='Inserisci']",
       "div.ql-editor[contenteditable='true']",
       "textarea[placeholder*='Ask']",
       "textarea[placeholder*='Message']",
+      "rich-textarea > div",
+      "rich-textarea",
       "div[contenteditable='true']",
       "textarea"
     ],
     "send_button": [
       "button[aria-label='Send message']",
+      "button[aria-label='Invia messaggio']",
       "button[aria-label*='Send message']",
+      "button[aria-label*='Invia messaggio']",
       "button[data-testid='send-button']",
-      "button[aria-label*='Send']",
+      "*[data-testid='send-button']",
+      "button[aria-label='Send']",
+      "button[aria-label='Invia']",
       "button[aria-label*='Send reply']",
-      "button[type='submit']"
+      "button[type='submit']",
+      "button.send-button"
+    ],
+    "send_button_blacklist": [
+      "*[aria-label*='Stop']",
+      "*[aria-label*='Cancel']",
+      "*[aria-label*='Interrompi']",
+      "*[aria-label*='Ferma']",
+      "*[aria-label*='Annulla']",
+      "*[data-testid*='stop']"
     ],
     "base_account_selector": "#app-root > main > top-bar-actions > div > div.right-section > div.buttons-container.adv-upsell.ng-star-inserted > g1-dynamic-upsell-button",
     "response_area": [
@@ -96,12 +114,14 @@
   },
   "login_detection": {
     "url_prefix": "https://gemini.google.com",
-    "url_deny_keywords": ["signin", "login"],
-    "login_button_xpath": "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]",
+    "url_deny_keywords": ["signin", "login", "accounts.google.com"],
     "authenticated_css_selectors": [
       "div.assistant-message",
       ".gemini-response",
-      ".chat-message.ai"
+      ".chat-message.ai",
+      "div.chat-input-container",
+      "button[aria-label*='Google Account']",
+      "a[href*='logout']"
     ]
   }
 }

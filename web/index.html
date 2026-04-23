@@ -135,6 +135,8 @@
         button.primary  { background: #1a73e8; color: #fff; border-color: #1a73e8; }
         button.primary:hover { background: #1558b0; }
         button.reload   { background: #f5a623; color: #fff; border-color: #f5a623; }
+        button.danger   { background: #c0392b; color: #fff; border-color: #c0392b; }
+        button.danger:hover { background: #96281b; }
 
         select, input, textarea {
             width: 100%;
@@ -310,8 +312,9 @@
                     <tr><td>Avg response time (per engine)</td><td id="stat-per-engine-ms">&#x2014;</td></tr>
                 </tbody>
             </table>
-            <div style="margin-top:10px;">
+            <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
                 <button onclick="clearState()" style="color:#c0392b; font-size:0.85rem;">&#x2716; Clear engine state</button>
+                <button class="danger" id="kill-session-btn" onclick="killSession()" style="font-size:0.85rem;">&#x1F480; Kill Session</button>
             </div>
         </div>
 
@@ -730,6 +733,23 @@
                 alert('Reset failed: ' + err.message);
             }
             refreshStats();
+        }
+
+        async function killSession() {
+            if (!confirm('⚠️ Kill Session?\n\nThis will SIGKILL the browser process immediately.\nAll in-flight requests will fail.\nThe browser will restart on the next request.\n\nContinue?')) {
+                return;
+            }
+            var btn = document.getElementById('kill-session-btn');
+            if (btn) { btn.disabled = true; btn.textContent = 'Killing…'; }
+            try {
+                var res = await fetchJson('/api/session/kill', { method: 'POST' });
+                alert('✅ ' + res.message);
+            } catch (err) {
+                alert('❌ Kill session failed: ' + err.message);
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '💀 Kill Session'; }
+                refreshStats();
+            }
         }
 
         // ----------------------------------------------------------------

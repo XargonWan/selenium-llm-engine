@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import glob
 import logging
 import json
@@ -19,7 +20,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -45,11 +46,17 @@ def shutdown_shared_driver() -> None:
         drv = _shared_driver
         _shared_driver = None
     if drv is not None:
-        try:
-            drv.quit()
-        except Exception as exc:
-            logger.warning("[selenium] shared driver quit error: %s", exc)
-            time.sleep(1)
+        # Use a timeout so we don't hang on a dead ChromeDriver process.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(drv.quit)
+            try:
+                fut.result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "[selenium] shared driver quit() timed out after 5s"
+                )
+            except Exception as exc:
+                logger.warning("[selenium] shared driver quit error: %s", exc)
     # Kill any remaining Chromium processes and remove lock files.
     profile_dir = os.getenv(
         "CHROMIUM_PROFILE_DIR", "/config/.config/chromium-synth"
@@ -75,6 +82,56 @@ def shutdown_shared_driver() -> None:
         except Exception:
             pass
     logger.info("[selenium] Shared driver shut down")
+
+
+def force_kill_session() -> None:
+    """Immediately SIGKILL the shared browser session without trying ``quit()``.
+
+    This is the "nuclear" option for when the browser is completely frozen
+    and ``driver.quit()`` would hang.  It:
+
+    1. Nullifies ``_shared_driver`` under the init lock.
+    2. Sends SIGKILL to all Chromium / ChromeDriver processes.
+    3. Cleans up lock files from the profile directory.
+
+    Engine instances remain in memory but their ``driver`` reference is
+    stale — the next request will automatically re-initialise the browser.
+    """
+    global _shared_driver
+    logger.warning("[selenium] force_kill_session invoked — SIGKILL mode")
+    with _CHROMIUM_INIT_LOCK:
+        _shared_driver = None
+
+    profile_dir = os.getenv(
+        "CHROMIUM_PROFILE_DIR", "/config/.config/chromium-synth"
+    )
+    patterns = [profile_dir] if profile_dir else [
+        "chromium", "chrome", "chromedriver", "undetected_chromedriver",
+    ]
+    for pattern in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                check=False, capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
+    # Remove lock files that would prevent a clean restart
+    if profile_dir:
+        lock_patterns = [
+            os.path.join(profile_dir, "SingletonLock"),
+            os.path.join(profile_dir, "SingletonCookie"),
+            os.path.join(profile_dir, "SingletonSocket"),
+        ]
+        for lock in lock_patterns:
+            try:
+                if os.path.exists(lock):
+                    os.remove(lock)
+            except Exception:
+                pass
+
+    logger.info("[selenium] force_kill_session complete — browser processes killed")
 
 
 class SeleniumLLMBase:
@@ -337,7 +394,7 @@ class SeleniumLLMBase:
         """
         global _shared_driver
 
-        if self.driver is not None:  # fast path — no lock needed
+        if self.driver is not None and self.driver is _shared_driver:  # fast path — no lock needed
             return self.driver
 
         with _CHROMIUM_INIT_LOCK:
@@ -557,71 +614,26 @@ class SeleniumLLMBase:
 
     def _save_cookies(self) -> None:
         """Persist current browser cookies to a JSON file (atomic write)."""
-        if self.driver is None:
-            return
-        try:
-            cookies = self.driver.get_cookies()
-            if not cookies:
-                return
-            path = self._cookie_path()
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(cookies, fh)
-            os.replace(tmp_path, path)
-            self._last_cookie_save = time.time()
-            logger.info(
-                "[selenium] Saved %d cookies to %s", len(cookies), path
-            )
-        except Exception as exc:
-            logger.warning("[selenium] Failed to save cookies: %s", exc)
+        pass
 
     def _restore_cookies(self) -> None:
         """Load previously saved cookies into the browser session."""
-        path = self._cookie_path()
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path, encoding="utf-8") as fh:
-                cookies = json.load(fh)
-            if not isinstance(cookies, list) or not cookies:
-                return
-
-            # Navigate to the service domain so cookies can be set on it.
-            assert self.driver is not None
-            self.driver.get(self.service_url)
-            time.sleep(1)
-
-            restored = 0
-            for cookie in cookies:
-                # Remove fields that Selenium rejects on add_cookie.
-                for key in ("sameSite", "httpOnly", "expiry"):
-                    cookie.pop(key, None)
-                try:
-                    self.driver.add_cookie(cookie)
-                    restored += 1
-                except Exception:
-                    pass  # skip individual cookie errors
-
-            if restored:
-                logger.info(
-                    "[selenium] Restored %d/%d cookies from %s",
-                    restored,
-                    len(cookies),
-                    path,
-                )
-                self.driver.refresh()
-                time.sleep(2)
-        except Exception as exc:
-            logger.warning("[selenium] Failed to restore cookies: %s", exc)
+        self._cookies_restored = True
 
     def _maybe_save_cookies(self) -> None:
-        """Save cookies if enough time has passed since the last save."""
-        if time.time() - self._last_cookie_save >= self._cookie_save_interval:
-            self._save_cookies()
+        """Disabled."""
+        pass
 
     # ------------------------------------------------------------------ readiness
 
     def _ensure_ready(self) -> None:
+        global _shared_driver
+        if self.driver is not None and self.driver is not _shared_driver:
+            logger.warning("[selenium] Invalidating stale driver reference because shared driver was reset")
+            self.driver = None
+            self._initialized = False
+            self._cookies_restored = False
+
         if not self._initialized or self.driver is None:
             self._init_driver()
         # Restore this engine's cookies once per session (per-domain).
@@ -687,13 +699,53 @@ class SeleniumLLMBase:
             logger.error(f"check_login_state error: {e}")
             return {"logged_in": False, "login_state": "unknown", "error": str(e)}
 
-    async def generate_response(self, prompt: str, media: list[Any] | None = None) -> str:
+    async def generate_response(
+        self, prompt: str, media: list[Any] | None = None, timeout: int | None = None,
+    ) -> str:
         """Send prompt and optional media to the LLM service and return the response text.
 
         All Selenium calls are executed in a thread pool via asyncio.to_thread
         so that blocking I/O never stalls the FastAPI event loop.
+
+        Parameters
+        ----------
+        timeout:
+            Maximum number of seconds to wait for the full generation cycle
+            (navigation + input + response).  ``None`` uses the default of
+            300 s (5 min), overridable via the ``SELENIUM_TOTAL_TIMEOUT``
+            environment variable.
         """
-        result = await asyncio.to_thread(self._sync_generate_response, prompt, media)
+        # Compute effective timeout: per-call > env var > default 300s (5 min)
+        if timeout is not None:
+            total_timeout = int(timeout)
+        else:
+            effective_max_wait = self._response_max_wait or 120
+            default_timeout = effective_max_wait + 180  # generous overhead
+            total_timeout = int(os.getenv("SELENIUM_TOTAL_TIMEOUT", str(default_timeout)))
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._sync_generate_response, prompt, media),
+                timeout=total_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[selenium] generate_response timed out after %ds — force-resetting driver",
+                total_timeout,
+            )
+            # Force-reset in a separate thread to unblock the stuck thread.
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._force_reset_driver),
+                    timeout=15,
+                )
+            except Exception as exc:
+                logger.warning("[selenium] _force_reset_driver error: %s", exc)
+            raise RuntimeError(
+                f"selenium_response_detection_timeout: generate_response "
+                f"exceeded total timeout of {total_timeout}s"
+            )
+
         # Periodically persist cookies after a successful prompt so that login
         # state survives even if the container is killed abruptly.
         try:
@@ -731,15 +783,64 @@ class SeleniumLLMBase:
         """Return True if *exc* signals that the LLM response was not detected in time."""
         return "selenium_response_detection_timeout" in str(exc)
 
+    def _quit_driver_with_timeout(self, driver: Any, timeout: int = 5) -> None:
+        """Attempt ``driver.quit()`` with a hard timeout.
+
+        If the driver process is dead or unresponsive, ``quit()`` blocks
+        indefinitely waiting for an HTTP reply from ChromeDriver.  This
+        wrapper caps the wait so that callers can proceed to cleanup.
+        """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(driver.quit)
+            try:
+                fut.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "[selenium] driver.quit() did not finish within %ds", timeout
+                )
+            except Exception as exc:
+                logger.warning("[selenium] driver.quit() error: %s", exc)
+
+    def _kill_chromium_processes(self) -> None:
+        """Immediately SIGKILL all Chromium processes (fast variant of cleanup)."""
+        patterns: list[str] = []
+        if self.profile_dir:
+            patterns.append(self.profile_dir)
+        else:
+            patterns.extend(["chromium", "chrome", "chromedriver"])
+
+        for pattern in patterns:
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", pattern],
+                    check=False, capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+        logger.info("[selenium] Chromium processes force-killed")
+
+    def _force_reset_driver(self) -> None:
+        """Force-kill the driver without trying ``driver.quit()``.
+
+        Used after a total-timeout when the Selenium thread is stuck.
+        Skips the polite quit() call (which would also hang) and goes
+        straight to SIGKILL.
+        """
+        global _shared_driver
+        logger.warning("[selenium] Force-resetting driver (skipping quit)…")
+        with _CHROMIUM_INIT_LOCK:
+            self.driver = None
+            _shared_driver = None
+            self._initialized = False
+            self._cookies_restored = False
+        self._kill_chromium_processes()
+
     def _reset_driver(self) -> None:
         """Kill the existing (dead) driver and reset state so _ensure_ready re-inits."""
         global _shared_driver
         logger.warning("[selenium] Resetting dead driver session…")
         if self.driver is not None:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            self._quit_driver_with_timeout(self.driver, timeout=5)
             self.driver = None
         _shared_driver = None  # force all engines to re-create on next use
         self._initialized = False
@@ -876,19 +977,24 @@ class SeleniumLLMBase:
             raise RuntimeError(f"redirect-stall: chunk 1/{n} not accepted after redirect")
         logger.info(f"[timing] chunk 1/{n} sent+accepted: {time.time() - chunk_t0:.2f}s")
 
-        # --- Pre-fill and send remaining chunks while previous is generating ---
-        # For each subsequent chunk: fill the input DURING generation of the
-        # previous chunk, then only wait for the send button to reappear.
+        # --- Send remaining chunks sequentially ---
         for idx in range(2, n + 1):
             is_final = idx == n
             next_text = parts[-1] if is_final else _intermediate_text(idx, parts[idx - 1])
             chunk_start = time.time()
             logger.debug(
-                f"[selenium] Pre-filling {'final ' if is_final else ''}chunk {idx}/{n} "
-                f"({len(next_text)} chars) during generation of chunk {idx - 1}/{n}"
+                f"[selenium] Processing {'final ' if is_final else ''}chunk {idx}/{n} "
+                f"({len(next_text)} chars)"
             )
 
-            # Pre-fill while the model is still generating the previous response.
+            # Wait for previous chunk generation to finish before touching the UI
+            send_ready_start = time.time()
+            if not self._wait_for_send_ready(driver):
+                raise RuntimeError(f"Send button did not become ready after chunk {idx - 1}/{n}")
+            send_ready_elapsed = time.time() - send_ready_start
+
+            # Find input and fill it
+            fill_start = time.time()
             input_el = self._find_interactable_element(
                 driver, self.prompt_area_selectors, timeout=5.0,
                 cache_attr="_cached_prompt_selector",
@@ -896,18 +1002,11 @@ class SeleniumLLMBase:
             if input_el is None:
                 raise RuntimeError(f"Could not find prompt input area for chunk {idx}/{n}")
             self._fill_input(driver, input_el, next_text)
-            prefill_elapsed = time.time() - chunk_start
-
-            # Wait only for the send button to reappear (generation of previous chunk done).
-            send_ready_start = time.time()
-            if not self._wait_for_send_ready(driver):
-                raise RuntimeError(
-                    f"Send button did not become ready after chunk {idx - 1}/{n}"
-                )
-            send_ready_elapsed = time.time() - send_ready_start
+            fill_elapsed = time.time() - fill_start
+            
             logger.info(
-                f"[timing] chunk {idx}/{n} prefill={prefill_elapsed:.2f}s "
-                f"send_ready_wait={send_ready_elapsed:.2f}s"
+                f"[timing] chunk {idx}/{n} ready_wait={send_ready_elapsed:.2f}s "
+                f"fill={fill_elapsed:.2f}s"
             )
 
             if is_final:
@@ -920,7 +1019,7 @@ class SeleniumLLMBase:
                         self._cached_prompt_selector = None
                         self._cached_send_selector = None
                         raise RuntimeError(
-                            "redirect-stall: final chunk not accepted after redirect"
+                            "redirect-stall: final chunk not accepted by UI after send"
                         )
                     response = self._wait_for_response(driver)
                     logger.info(
@@ -940,9 +1039,9 @@ class SeleniumLLMBase:
                     self._cached_prompt_selector = None
                     self._cached_send_selector = None
                     raise RuntimeError(
-                        f"redirect-stall: chunk {idx}/{n} not accepted after redirect"
+                        f"redirect-stall: chunk {idx}/{n} not accepted by UI after send"
                     )
-                logger.debug(f"[selenium] Chunk {idx}/{n} accepted (pre-filled during generation)")
+                logger.debug(f"[selenium] Chunk {idx}/{n} accepted (completed intermediate send)")
 
         # Never reached: n >= 2 is guaranteed by max(min_parts, 2).
         raise RuntimeError("_execute_chunked_send: unexpected exit after loop")
@@ -951,14 +1050,39 @@ class SeleniumLLMBase:
 
     def _sync_generate_response(self, prompt: str, media: list[Any] | None = None) -> str:
         """Synchronous core of generate_response — runs in a worker thread."""
-        for attempt in range(2):
+        max_attempts = 5
+        for attempt in range(max_attempts):
             try:
                 try:
                     return self._sync_generate_response_once(prompt, media)
                 except TypeError:
                     return self._sync_generate_response_once(prompt)
-            except RuntimeError as e:
-                if attempt == 0:
+            except (RuntimeError, TimeoutException) as e:
+                is_chunking_freeze = any(msg in str(e) for msg in [
+                    "Send button did not become ready",
+                    "redirect-stall",
+                    "not accepted by UI",
+                    "Could not find prompt input area",
+                    "selenium_response_detection_timeout",
+                    "TimeoutException",
+                    "disconnected"
+                ])
+                
+                # Dynamic prompt resizing: if the prompt is massive and the UI
+                # crashed/timed-out, forcefully increase chunks and reset the tab.
+                if is_chunking_freeze and self._should_split_prompt(prompt) and attempt < max_attempts - 1:
+                    self._split_prompt_parts += 1
+                    logger.warning(
+                        f"[selenium] Chunking failure or UI freeze on attempt {attempt + 1}: {e}. "
+                        f"Dynamically resizing split_prompt_parts to {self._split_prompt_parts} and retrying."
+                    )
+                    self._reset_driver()
+                    continue
+
+                if attempt >= max_attempts - 1:
+                    raise
+
+                if isinstance(e, RuntimeError):
                     if self._is_dead_session(e):
                         if not getattr(self, "_prefer_webdriver_fallback", False):
                             logger.warning(
@@ -979,9 +1103,6 @@ class SeleniumLLMBase:
                         continue
                     if self._is_response_detection_timeout(e):
                         if getattr(self, "_generation_was_active", False):
-                            # The model was visibly generating (stop-button seen) but
-                            # didn't finish within max_wait.  Don't reset the driver —
-                            # it would kill the active session.  Just retry as-is.
                             logger.warning(
                                 f"[selenium] Response detection timeout on attempt {attempt + 1} "
                                 "(model was actively generating — slow/thinking model, skipping driver reset)"
@@ -993,8 +1114,24 @@ class SeleniumLLMBase:
                             )
                             self._reset_driver()
                         continue
-                raise
-        # Should not be reached, but satisfy mypy
+                else: 
+                    # TimeoutException
+                    if self._is_response_detection_timeout(e):
+                        if getattr(self, "_generation_was_active", False):
+                            logger.warning(
+                                f"[selenium] Response detection timeout on attempt {attempt + 1} "
+                                "(model was actively generating — slow/thinking model, skipping driver reset)"
+                            )
+                        else:
+                            logger.warning(
+                                f"[selenium] Response detection timeout on attempt {attempt + 1}, "
+                                "resetting driver and retrying…"
+                            )
+                            self._reset_driver()
+                        continue
+
+            logger.warning(f"[selenium] Unhandled exception on attempt {attempt + 1}: {e}. Retrying...")
+            
         raise RuntimeError("_sync_generate_response exhausted retries")
 
     def _sync_generate_response_once(self, prompt: str, media: list[Any] | None = None) -> str:
@@ -2026,12 +2163,12 @@ class SeleniumLLMBase:
                 # immediately enable the send button without waiting for synthetic events.
                 try:
                     driver.execute_script(
-                        "arguments[0].dispatchEvent("
-                        "  new InputEvent('input', {bubbles:true, cancelable:true})"
-                        ");"
-                        "arguments[0].dispatchEvent("
-                        "  new Event('change', {bubbles:true})"
-                        ");",
+                        "const el = arguments[0];"
+                        "const evOpt = {bubbles:true, cancelable:true, composed:true};"
+                        "el.dispatchEvent(new InputEvent('input', evOpt));"
+                        "el.dispatchEvent(new KeyboardEvent('keyup', evOpt));"
+                        "el.dispatchEvent(new Event('change', evOpt));"
+                        "el.dispatchEvent(new Event('blur', evOpt));",
                         element,
                     )
                 except Exception:
@@ -2105,12 +2242,21 @@ class SeleniumLLMBase:
             return False
 
         def _resolve_click_target(element: Any) -> Any:
-            """If selector matches icon SVG, resolve up to a parent button."""
+            """If selector matches icon SVG or inner span, resolve up to a parent button or role='button'."""
             try:
-                if element.tag_name.lower() == "svg":
-                    parent_btn = element.find_element(By.XPATH, "ancestor::button[1]")
-                    if parent_btn is not None:
-                        return parent_btn
+                tag = (element.tag_name or "").lower()
+                if tag in ("svg", "path", "span", "mat-icon", "i"):
+                    # Climb up to find something that looks like a click target
+                    parent = driver.execute_script(
+                        "let el = arguments[0];"
+                        "while (el && el.tagName !== 'BODY') {"
+                        "  if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.onclick) return el;"
+                        "  el = el.parentElement;"
+                        "}"
+                        "return arguments[0];",
+                        element
+                    )
+                    return parent if parent else element
             except Exception:
                 pass
             return element
@@ -2154,22 +2300,22 @@ class SeleniumLLMBase:
                     for btn in candidates:
                         try:
                             resolved_btn = _resolve_click_target(btn)
-                            if resolved_btn.is_displayed() and resolved_btn.is_enabled():
-                                try:
+                            if resolved_btn.is_displayed():
+                                enabled = resolved_btn.is_enabled()
+                                # Some frameworks use 'disabled' attribute on non-button elements
+                                aria_disabled = resolved_btn.get_attribute("aria-disabled") == "true"
+                                if enabled and not aria_disabled:
                                     if _safe_click(resolved_btn, sel):
                                         self._cached_send_selector = sel
                                         return True
-                                except StaleElementReferenceException as e:
-                                    logger.warning(
-                                        f"[selenium] Stale send button in fallback for selector {sel}; continuing: {e}"
-                                    )
-                                    if self._cached_send_selector == sel:
-                                        self._cached_send_selector = None
-                                    continue
+                                else:
+                                    logger.debug(f"[selenium] Button {sel} found but disabled (enabled={enabled}, aria_disabled={aria_disabled})")
                         except StaleElementReferenceException as e:
                             logger.warning(
-                                f"[selenium] Stale resolved send button for selector {sel}; continuing: {e}"
+                                f"[selenium] Stale send button in fallback for selector {sel}; continuing: {e}"
                             )
+                            if self._cached_send_selector == sel:
+                                self._cached_send_selector = None
                             continue
                         except Exception:
                             pass
@@ -2187,7 +2333,13 @@ class SeleniumLLMBase:
                 )
                 self._cached_prompt_selector = None
                 self._cached_send_selector = None
-                time.sleep(0.3)
+                # Try to escape any popups or overlays that might be blocking the click
+                try:
+                    driver.execute_script("document.body.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));")
+                    input_el.send_keys(Keys.ESCAPE)
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
             try:
                 if _attempt_click():
@@ -2234,9 +2386,20 @@ class SeleniumLLMBase:
                     btns = driver.find_elements(By.CSS_SELECTOR, sel)
                     for btn in btns:
                         try:
-                            if btn.is_displayed() and btn.is_enabled():
-                                logger.debug(f"[selenium] Send button ready: {sel}")
-                                return True
+                            if btn.is_displayed() and btn.is_enabled() and not self._is_button_blacklisted(btn):
+                                # Double check that a stop/generating signal isn't presently visible
+                                stop_visible = False
+                                for s_sel in self.stop_selectors:
+                                    try:
+                                        s_btns = driver.find_elements(By.CSS_SELECTOR, s_sel)
+                                        if any(b.is_displayed() for b in s_btns):
+                                            stop_visible = True
+                                            break
+                                    except Exception:
+                                        pass
+                                if not stop_visible:
+                                    logger.debug(f"[selenium] Send button ready: {sel}")
+                                    return True
                         except Exception:
                             pass
                 except Exception as e:
@@ -2351,6 +2514,7 @@ class SeleniumLLMBase:
         stable_counter = 0
         iteration = 0
         last_container = None
+        last_activity_time = time.time()
 
         while time.time() < deadline:
             iteration += 1
@@ -2384,13 +2548,16 @@ class SeleniumLLMBase:
                     iteration,
                 )
 
-                if previous_text_length != -1 and previous_child_count != -1:
+                if (
+                    previous_text_length != -1 and previous_child_count != -1
+                ):
                     if (
                         current_text_length != previous_text_length
                         or current_child_count != previous_child_count
                     ):
                         stable_counter = 0
                         self._generation_was_active = True
+                        last_activity_time = time.time()
                     elif current_text_length > 0 or current_child_count > 0:
                         if not baseline or self._extract_response_text_from_element(
                             driver, container
@@ -2402,6 +2569,12 @@ class SeleniumLLMBase:
                         stable_counter = 0
                 previous_text_length = current_text_length
                 previous_child_count = current_child_count
+
+                # Early freeze detection: if the "Stop" button is present but
+                # there's been no text expansion for > 20s, it's a silent hang.
+                if self._stop_button_present(driver) and (time.time() - last_activity_time) > 20:
+                    logger.warning("[selenium] Silent freeze detected: Stop button visible but no activity for 20s")
+                    raise TimeoutException("Silent freeze detected during generation")
 
                 if stable_counter >= 2:
                     response = self._extract_response_text_from_element(driver, container)

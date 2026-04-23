@@ -231,10 +231,11 @@ def _extract_text_and_media(content: Any, media_items: list[MediaItem]) -> str:
         if "text" in content and content["text"] is not content.get("content"):
             text_parts.append(_extract_text_and_media(content["text"], media_items))
 
-        for key, value in content.items():
-            if key in ("type", "attachments", "content", "text"):
-                continue
-            text_parts.append(_extract_text_and_media(value, media_items))
+        # Only recurse into 'parts' or 'messages' if they exist, but avoid
+        # generic iteration over all keys to prevent metadata/internal field leakage.
+        for key in ("parts", "messages"):
+            if key in content and isinstance(content[key], list):
+                text_parts.append(_extract_text_and_media(content[key], media_items))
 
         return "".join(text_parts)
 
@@ -598,6 +599,7 @@ async def engine_prompt(engine_name: str, req: Request) -> Any:
         explicit_prompt=data.get("prompt") or data.get("messages"),
         model_name=data.get("model", canonical),
         stream=bool(data.get("stream", False)),
+        timeout=data.get("timeout"),
     )
 
 
@@ -624,6 +626,7 @@ def _register_engine_routes(application: FastAPI) -> None:
                     explicit_prompt=data.get("prompt") or data.get("messages"),
                     model_name=name,
                     stream=bool(data.get("stream", False)),
+                    timeout=data.get("timeout"),
                 )
 
             handler.__name__ = f"{name}_prompt"
@@ -710,7 +713,8 @@ async def openai_chat(req: Request) -> Any:
     stream = bool(data.get("stream", False))
 
     return await _prompt(
-        engine, req, explicit_prompt=prompt_payload, model_name=model, stream=stream
+        engine, req, explicit_prompt=prompt_payload, model_name=model, stream=stream,
+        timeout=data.get("timeout"),
     )
 
 
@@ -726,6 +730,7 @@ async def _prompt(
     explicit_prompt: Any = None,
     model_name: str = "default",
     stream: bool = False,
+    timeout: int | None = None,
 ) -> Any:
     if RESET_IN_PROGRESS:
         raise HTTPException(
@@ -768,7 +773,8 @@ async def _prompt(
                     # Start engine work as a concurrent task so we can yield
                     # SSE heartbeats while waiting, keeping the connection alive.
                     result_future = asyncio.ensure_future(
-                        mgr.enqueue(engine_name, prompt_text, media_items)
+                        mgr.enqueue(engine_name, prompt_text, media_items,
+                                    timeout=timeout)
                     )
 
                     heartbeat_interval = 5.0  # seconds
@@ -811,7 +817,8 @@ async def _prompt(
 
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
-        result_obj = await mgr.enqueue(engine_name, prompt_text, media_items)
+        result_obj = await mgr.enqueue(engine_name, prompt_text, media_items,
+                                        timeout=timeout)
         duration_ms = int((time.time() - start) * 1000)
         if media_items:
             inc_media_sent(len(media_items))
@@ -984,6 +991,52 @@ async def reset_state() -> Dict[str, Any]:
 @app.post("/api/reset")
 async def api_reset_state() -> Dict[str, Any]:
     return await reset_state()
+
+
+@app.post("/api/session/kill")
+async def kill_session() -> Dict[str, Any]:
+    """Force-kill the browser session immediately (SIGKILL).
+
+    Use this when the browser is completely frozen and normal reset
+    doesn't work.  Engine instances stay in memory and will
+    auto-reinitialise the browser on the next request.
+    """
+    from core.selenium_llm_base import force_kill_session
+
+    manager = EngineManager.get()
+    errors: list[str] = []
+
+    # Drain queues so pending jobs don't pile up on the dead session
+    try:
+        await manager.drain_queues()
+    except Exception as e:
+        logger.warning(f"[kill_session] drain_queues error: {e}")
+        errors.append(f"drain: {e}")
+
+    # Invalidate driver references on all engine instances
+    for name, engine in manager.engines.items():
+        try:
+            engine.driver = None
+            engine._initialized = False
+            engine._cookies_restored = False
+        except Exception as e:
+            logger.warning(f"[kill_session] clear engine {name}: {e}")
+            errors.append(f"engine_{name}: {e}")
+
+    # Force-kill browser processes
+    try:
+        await asyncio.to_thread(force_kill_session)
+    except Exception as e:
+        logger.error(f"[kill_session] force_kill_session error: {e}")
+        errors.append(f"kill: {e}")
+
+    message = (
+        "Browser session killed — next request will start a new session"
+        if not errors
+        else f"Browser session killed (with errors: {'; '.join(errors)})"
+    )
+    logger.info(f"[kill_session] {message}")
+    return {"status": "ok", "message": message}
 
 
 @app.get("/logs")
