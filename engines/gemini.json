@@ -5,6 +5,7 @@
   "service_url": "https://gemini.google.com",
   "default_model": "2.5-flash",
   "response_max_wait": 60,
+  "total_timeout": 480,
   "use_baseline_comparison": false,
   "allow_unlogged": true,
   "models": {
@@ -51,7 +52,16 @@
       "*[aria-label*='Interrompi']",
       "*[aria-label*='Ferma']",
       "*[aria-label*='Annulla']",
-      "*[data-testid*='stop']"
+      "*[data-testid*='stop']",
+      "button[aria-label*='microphone']",
+      "button[aria-label*='mic']",
+      "button[aria-label*='voice']",
+      "button[aria-label*='audio']",
+      "*[data-testid*='mic']",
+      "*[data-testid*='microphone']",
+      "button[aria-label*='Voice input']",
+      "mat-icon[fonticon='mic']",
+      "button mat-icon[fonticon='mic']"
     ],
     "base_account_selector": "#app-root > main > top-bar-actions > div > div.right-section > div.buttons-container.adv-upsell.ng-star-inserted > g1-dynamic-upsell-button",
     "response_area": [

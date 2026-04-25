@@ -418,7 +418,8 @@ class SeleniumLLMBase:
 
             # ---- create a fresh driver ----
             logger.info("[selenium] Initializing Chrome driver...")
-            self._cleanup_chromium_remnants()
+            # Light cleanup - only kill processes if they exist
+            self._cleanup_chromium_remnants(light=True)
 
             chromium_binary = self._locate_chromium_binary() or "/usr/bin/chromium"
             chromedriver_path = (
@@ -427,12 +428,6 @@ class SeleniumLLMBase:
 
             # Get Chromium major version for uc compatibility
             chromium_major = self._get_chromium_major_version(chromium_binary)
-
-            # Clear undetected-chromedriver cache to avoid stale patched binaries
-            uc_cache_dir = os.path.join(tempfile.gettempdir(), "undetected_chromedriver")
-            if os.path.exists(uc_cache_dir):
-                shutil.rmtree(uc_cache_dir, ignore_errors=True)
-                logger.info("[selenium] Cleared undetected-chromedriver cache")
 
             max_retries = 3
             self.driver = None
@@ -514,8 +509,12 @@ class SeleniumLLMBase:
             logger.info("[selenium] Driver initialized successfully (shared)")
             return self.driver
 
-    def _cleanup_chromium_remnants(self) -> None:
-        """Aggressively clean up Chromium processes and lock files (SyntH pattern)."""
+    def _cleanup_chromium_remnants(self, light: bool = False) -> None:
+        """Clean up Chromium processes and lock files.
+        
+        Args:
+            light: If True, do minimal cleanup (skip sleep, faster kill).
+        """
         try:
             logger.info("[selenium] Cleaning up Chromium remnants...")
 
@@ -540,13 +539,14 @@ class SeleniumLLMBase:
                         ["pkill", "-15", "-f", pattern],
                         check=False,
                         capture_output=True,
-                        timeout=5,
+                        timeout=2,
                     )
                 except Exception:
                     pass
 
             # Give Chrome time to flush profile (cookies, session storage) before SIGKILL
-            time.sleep(3)
+            if not light:
+                time.sleep(1)
 
             for pattern in patterns:
                 try:
@@ -555,13 +555,14 @@ class SeleniumLLMBase:
                         ["pkill", "-9", "-f", pattern],
                         check=False,
                         capture_output=True,
-                        timeout=5,
+                        timeout=2,
                     )
                 except Exception:
                     pass
 
             # Brief wait after SIGKILL before removing lock files
-            time.sleep(0.5)
+            if not light:
+                time.sleep(0.2)
             logger.info("[selenium] Chromium processes killed")
 
             # Clean up temp dir lock files
@@ -600,7 +601,8 @@ class SeleniumLLMBase:
                         except Exception:
                             pass
 
-            time.sleep(0.5)
+            if not light:
+                time.sleep(0.2)
             logger.info("[selenium] Chromium cleanup completed")
         except Exception as e:
             logger.warning(f"[selenium] Error during Chromium cleanup: {e}")
@@ -971,50 +973,67 @@ class SeleniumLLMBase:
         self._click_accept_buttons(driver, timeout=2.0)
         self._click_send(driver, input_el)
         self._click_accept_buttons(driver, timeout=2.0)
-        if not self._post_send_check(driver):
+        # For chunked mode, use shorter timeout - just need to see generation started
+        if not self._post_send_check(driver, timeout=8.0):
             self._cached_prompt_selector = None
             self._cached_send_selector = None
             raise RuntimeError(f"redirect-stall: chunk 1/{n} not accepted after redirect")
         logger.info(f"[timing] chunk 1/{n} sent+accepted: {time.time() - chunk_t0:.2f}s")
 
         # --- Send remaining chunks sequentially ---
+        # Pipeline: fill chunk idx -> wait for send button (LLM finished idx-1) -> send chunk idx
         for idx in range(2, n + 1):
             is_final = idx == n
-            next_text = parts[-1] if is_final else _intermediate_text(idx, parts[idx - 1])
             chunk_start = time.time()
-            logger.debug(
-                f"[selenium] Processing {'final ' if is_final else ''}chunk {idx}/{n} "
-                f"({len(next_text)} chars)"
-            )
 
-            # Wait for previous chunk generation to finish before touching the UI
-            send_ready_start = time.time()
-            if not self._wait_for_send_ready(driver):
-                raise RuntimeError(f"Send button did not become ready after chunk {idx - 1}/{n}")
-            send_ready_elapsed = time.time() - send_ready_start
+            # Step 1: Fill chunk idx IMMEDIATELY after previous send
+            next_text = parts[idx - 1] if not is_final else parts[-1]
+            if not is_final:
+                next_text = _intermediate_text(idx, next_text)
 
-            # Find input and fill it
-            fill_start = time.time()
             input_el = self._find_interactable_element(
                 driver, self.prompt_area_selectors, timeout=5.0,
                 cache_attr="_cached_prompt_selector",
             )
             if input_el is None:
                 raise RuntimeError(f"Could not find prompt input area for chunk {idx}/{n}")
+
             self._fill_input(driver, input_el, next_text)
-            fill_elapsed = time.time() - fill_start
-            
-            logger.info(
-                f"[timing] chunk {idx}/{n} ready_wait={send_ready_elapsed:.2f}s "
-                f"fill={fill_elapsed:.2f}s"
-            )
+            logger.debug(f"[selenium] Filled chunk {idx} ({len(next_text)} chars)")
+
+            # Step 2: Wait for send button (LLM finished processing chunk idx-1)
+            chunk_timeout = 30.0 if is_final else 5.0
+            send_ready_start = time.time()
+            if not self._wait_for_send_ready(driver, timeout=chunk_timeout):
+                if is_final:
+                    logger.warning(
+                        f"[selenium] Send button not found after {chunk_timeout}s for final chunk, proceeding..."
+                    )
+                else:
+                    logger.debug(
+                        f"[selenium] Chunk {idx-1} not ready after {chunk_timeout}s, proceeding"
+                    )
+
+            send_elapsed = time.time() - send_ready_start
+            logger.info(f"[timing] chunk {idx}/{n} wait={send_elapsed:.2f}s")
+
+            # Step 3: Send the chunk (which is already filled)
+            self._click_accept_buttons(driver, timeout=2.0)
+            try:
+                self._click_send(driver, input_el)
+            except Exception:
+                logger.warning(f"[selenium] Click send failed, using Enter key fallback")
+                try:
+                    input_el.send_keys(Keys.RETURN)
+                except Exception:
+                    pass
+            self._click_accept_buttons(driver, timeout=2.0)
+            logger.debug(f"[selenium] Sent chunk {idx}")
 
             if is_final:
+                # Final chunk: verify it was accepted and wait for response
                 self._skip_split_for_next = True
                 try:
-                    self._click_accept_buttons(driver, timeout=2.0)
-                    self._click_send(driver, input_el)
-                    self._click_accept_buttons(driver, timeout=2.0)
                     if not self._post_send_check(driver):
                         self._cached_prompt_selector = None
                         self._cached_send_selector = None
@@ -1032,16 +1051,14 @@ class SeleniumLLMBase:
                 finally:
                     self._skip_split_for_next = False
             else:
-                self._click_accept_buttons(driver, timeout=2.0)
-                self._click_send(driver, input_el)
-                self._click_accept_buttons(driver, timeout=2.0)
-                if not self._post_send_check(driver):
+                # Verify intermediate chunk was accepted (stop button appears)
+                if not self._post_send_check(driver, timeout=5.0):
                     self._cached_prompt_selector = None
                     self._cached_send_selector = None
                     raise RuntimeError(
                         f"redirect-stall: chunk {idx}/{n} not accepted by UI after send"
                     )
-                logger.debug(f"[selenium] Chunk {idx}/{n} accepted (completed intermediate send)")
+                logger.debug(f"[selenium] Chunk {idx}/{n} accepted")
 
         # Never reached: n >= 2 is guaranteed by max(min_parts, 2).
         raise RuntimeError("_execute_chunked_send: unexpected exit after loop")
@@ -1059,7 +1076,7 @@ class SeleniumLLMBase:
                     return self._sync_generate_response_once(prompt)
             except (RuntimeError, TimeoutException) as e:
                 is_chunking_freeze = any(msg in str(e) for msg in [
-                    "Send button did not become ready",
+                    "Send button did not become ready after final chunk",
                     "redirect-stall",
                     "not accepted by UI",
                     "Could not find prompt input area",
@@ -1068,12 +1085,12 @@ class SeleniumLLMBase:
                     "disconnected"
                 ])
                 
-                # Dynamic prompt resizing: if the prompt is massive and the UI
-                # crashed/timed-out, forcefully increase chunks and reset the tab.
+                # Dynamic prompt resizing: only for truly massive prompts that fail
+                # multiple times - don't reset driver on every timeout
                 if is_chunking_freeze and self._should_split_prompt(prompt) and attempt < max_attempts - 1:
                     self._split_prompt_parts += 1
                     logger.warning(
-                        f"[selenium] Chunking failure or UI freeze on attempt {attempt + 1}: {e}. "
+                        f"[selenium] Chunking failure on attempt {attempt + 1}: {e}. "
                         f"Dynamically resizing split_prompt_parts to {self._split_prompt_parts} and retrying."
                     )
                     self._reset_driver()
@@ -1879,6 +1896,25 @@ class SeleniumLLMBase:
                 pass
         return False
 
+    def _stop_button_present(self, driver: Any) -> bool:
+        """Return True if the stop button is visible (model is still generating).
+
+        Used for early freeze detection: if stop button is visible but there's
+        no text expansion for > 20s, it's a silent hang.
+        """
+        for sel in self.stop_selectors:
+            try:
+                btns = driver.find_elements(By.CSS_SELECTOR, sel)
+                for b in btns:
+                    try:
+                        if b.is_displayed():
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return False
+
     def _find_response_container_element(
         self,
         driver: Any,
@@ -2098,7 +2134,7 @@ class SeleniumLLMBase:
                     driver.execute_script(
                         "arguments[0].scrollIntoView({block:'center'});", element
                     )
-                    time.sleep(0.2)
+                    time.sleep(0.3)
                 except Exception:
                     pass
 
@@ -2106,7 +2142,7 @@ class SeleniumLLMBase:
                     element.click()
                 except Exception:
                     driver.execute_script("arguments[0].click();", element)
-                time.sleep(0.1)
+                    time.sleep(0.1)
 
                 tag = (element.tag_name or "").lower()
                 if tag in ("textarea", "input"):
@@ -2206,7 +2242,7 @@ class SeleniumLLMBase:
         Retries stale element references and transient failures to avoid dropped
         prompts where the UI updates between finding and clicking the button.
         """
-        max_attempts = int(os.getenv("SELENIUM_SEND_CLICK_RETRIES", "3"))
+        max_attempts = int(os.getenv("SELENIUM_SEND_CLICK_RETRIES", "1"))
 
         def _is_button_blacklisted(btn: Any) -> bool:
             for bl_sel in self.send_button_blacklist:
@@ -2370,34 +2406,39 @@ class SeleniumLLMBase:
         except Exception as e:
             logger.error(f"[selenium] Could not send prompt: {e}")
 
-    def _wait_for_send_ready(self, driver: Any, timeout: float = 30.0) -> bool:
-        """Wait until the send button is visible and enabled (generation complete).
+    def _wait_for_send_ready(self, driver: Any, timeout: float = 10.0) -> bool:
+        """Wait until the send button appears (LLM finished generating).
 
-        Used by chunked sending to detect when the model has finished generating
-        its acknowledgement and the pre-filled next chunk can be submitted.
-        Polls every 0.2 s up to *timeout* seconds.
+        Used by chunked sending - we only care that the LLM has finished generating,
+        then we can fill the next chunk and click send when ready.
+        Polls every 0.3 s up to *timeout* seconds.
         Env var: ``SELENIUM_SEND_READY_TIMEOUT`` overrides the default.
         """
         timeout = float(os.getenv("SELENIUM_SEND_READY_TIMEOUT", str(timeout)))
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # Check: Send button is ready (LLM finished generating)
             for sel in self.send_button_selectors:
                 try:
                     btns = driver.find_elements(By.CSS_SELECTOR, sel)
                     for btn in btns:
                         try:
-                            if btn.is_displayed() and btn.is_enabled() and not self._is_button_blacklisted(btn):
-                                # Double check that a stop/generating signal isn't presently visible
-                                stop_visible = False
-                                for s_sel in self.stop_selectors:
-                                    try:
-                                        s_btns = driver.find_elements(By.CSS_SELECTOR, s_sel)
-                                        if any(b.is_displayed() for b in s_btns):
-                                            stop_visible = True
-                                            break
-                                    except Exception:
-                                        pass
-                                if not stop_visible:
+                            if btn.is_displayed() and btn.is_enabled():
+                                # Additional check: verify it's not a blacklisted element by checking attributes
+                                aria_label = btn.get_attribute("aria-label") or ""
+                                data_testid = btn.get_attribute("data-testid") or ""
+                                tag = btn.tag_name or ""
+                                
+                                # Skip if it looks like stop/cancel/mic button
+                                skip = False
+                                for pattern in ["stop", "cancel", "mic", "voice"]:
+                                    if pattern in aria_label.lower() or pattern in data_testid.lower():
+                                        skip = True
+                                        break
+                                if tag == "mat-icon" and "mic" in (btn.get_attribute("fonticon") or "").lower():
+                                    skip = True
+                                    
+                                if not skip:
                                     logger.debug(f"[selenium] Send button ready: {sel}")
                                     return True
                         except Exception:
