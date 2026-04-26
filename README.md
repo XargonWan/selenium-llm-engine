@@ -212,8 +212,36 @@ This runs the same service under `http://localhost:14848` (and `http://localhost
 - `core/` - Selenium engine wrappers and manager
 - `db/` - SQLite persistence helpers
 - `web/` - minimal static UI
-- `tests/` - API tests
+- `tests/` - API tests and `stress_test.py` (manual, excluded from CI)
 - `Dockerfile`, `docker-compose.yml` - container setup
+
+## Stress Test Results
+
+A ramp-up stress test was run against the live system with the following setup:
+- 10 long prompts (~3,000–8,000 chars each) sent to Gemini with delays ramping from 30s down to 0s
+- 10 long prompts sent to ChatGPT (same ramp-up pattern)
+- 5 prompts each sent in burst to: claude, copilot, perplexity, stepfun, grok
+
+### Average Response Times
+
+| Engine | Avg Response | Notes |
+|--------|-------------|-------|
+| copilot | 16.9s | Fastest, but unstable under load |
+| perplexity | 35.2s | Moderately stable |
+| chatgpt (unlogged) | 71.1s | Slow, high variance (42–426s) |
+| claude (unlogged) | 79.0s | Error-prone in unlogged mode |
+| gemini | 94.8s | Slowest but most reliable |
+
+### System Soliditude
+
+- **FIFO queue**: No race conditions detected; requests to each engine are processed sequentially and correctly.
+- **Per-engine parallelism**: Each engine processes independently; no cross-engine interference.
+- **Failure modes**: The dominant failure cause is `fill_input` verification rejecting long prompts that the target site reformats (e.g., ChatGPT truncating or reformatting prompt text before sending). A secondary issue is a `Connection pool is full` warning indicating a single-connection pool to the Chrome driver, which creates a bottleneck during burst traffic.
+- **Engines requiring login**: stepfun, grok, and (partially) claude are unreliable or non-functional without authenticated sessions.
+
+### Overall Assessment
+
+The system handles concurrent load across multiple engines without deadlocks or queue corruption. The FIFO queue is the strongest component. Browser stability under sustained burst traffic is the main fragility — driven by input verification strictness and connection pool limitations rather than the queue itself.
 
 ## Legal / Terms of Service (ToS) Notice
 
