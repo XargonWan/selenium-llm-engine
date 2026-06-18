@@ -87,7 +87,9 @@
     "accept_button": [
       "upload-image-disclaimer-dialog button[data-test-id='upload-image-agree-button']",
       "upload-image-disclaimer-dialog button[aria-label*='Agree']",
-      "#mat-mdc-dialog-1 > div > div > digital-wellbeing-nudge > div > div.digital-wellbeing-nudge-actions > button > span.mat-mdc-button-touch-target"
+      "#mat-mdc-dialog-1 > div > div > digital-wellbeing-nudge > div > div.digital-wellbeing-nudge-actions > button > span.mat-mdc-button-touch-target",
+      "#chat-history > div.restart-chat-button-container.ng-star-inserted > button",
+      "span.gds-title-m"
     ],
     "stop": [
       "button[aria-label='Stop response']",
