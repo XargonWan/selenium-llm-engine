@@ -225,6 +225,10 @@ class SeleniumLLMBase:
         # stable text instead of comparing against prior baseline text.
         self._use_baseline_comparison: bool = True
 
+        # Silent freeze recovery: track page refresh attempts before driver reset
+        self._page_refresh_attempts: int = 0
+        self._max_page_refresh_attempts: int = int(os.getenv("SELENIUM_MAX_PAGE_REFRESH", "2"))
+
         # Timestamp of the last cookie save — used to rate-limit periodic saves.
         self._last_cookie_save: float = 0.0
         # Minimum interval (seconds) between periodic cookie saves.
@@ -785,6 +789,10 @@ class SeleniumLLMBase:
         """Return True if *exc* signals that the LLM response was not detected in time."""
         return "selenium_response_detection_timeout" in str(exc)
 
+    def _is_page_refresh_required(self, exc: Exception) -> bool:
+        """Return True if *exc* signals that a page refresh was performed due to silent freeze."""
+        return "page_refresh_required" in str(exc)
+
     def _quit_driver_with_timeout(self, driver: Any, timeout: int = 5) -> None:
         """Attempt ``driver.quit()`` with a hard timeout.
 
@@ -835,6 +843,7 @@ class SeleniumLLMBase:
             _shared_driver = None
             self._initialized = False
             self._cookies_restored = False
+            self._page_refresh_attempts = 0
         self._kill_chromium_processes()
 
     def _reset_driver(self) -> None:
@@ -847,6 +856,7 @@ class SeleniumLLMBase:
         _shared_driver = None  # force all engines to re-create on next use
         self._initialized = False
         self._cookies_restored = False
+        self._page_refresh_attempts = 0
         self._cleanup_chromium_remnants()
 
     def _is_captcha_present(self, driver: Any) -> bool:
@@ -1022,7 +1032,7 @@ class SeleniumLLMBase:
             try:
                 self._click_send(driver, input_el)
             except Exception:
-                logger.warning(f"[selenium] Click send failed, using Enter key fallback")
+                logger.warning("[selenium] Click send failed, using Enter key fallback")
                 try:
                     input_el.send_keys(Keys.RETURN)
                 except Exception:
@@ -1100,6 +1110,21 @@ class SeleniumLLMBase:
                     raise
 
                 if isinstance(e, RuntimeError):
+                    if self._is_page_refresh_required(e):
+                        if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                            logger.warning(
+                                f"[selenium] Page refresh was performed on attempt {attempt + 1}, "
+                                "retrying without driver reset…"
+                            )
+                            # Driver already refreshed in _wait_for_response; just retry
+                            continue
+                        else:
+                            logger.warning(
+                                f"[selenium] Max page refresh attempts reached on attempt {attempt + 1}, "
+                                "resetting driver and retrying…"
+                            )
+                            self._reset_driver()
+                            continue
                     if self._is_dead_session(e):
                         if not getattr(self, "_prefer_webdriver_fallback", False):
                             logger.warning(
@@ -1147,8 +1172,6 @@ class SeleniumLLMBase:
                             self._reset_driver()
                         continue
 
-            logger.warning(f"[selenium] Unhandled exception on attempt {attempt + 1}: {e}. Retrying...")
-            
         raise RuntimeError("_sync_generate_response exhausted retries")
 
     def _sync_generate_response_once(self, prompt: str, media: list[Any] | None = None) -> str:
@@ -2615,6 +2638,27 @@ class SeleniumLLMBase:
                 # there's been no text expansion for > 20s, it's a silent hang.
                 if self._stop_button_present(driver) and (time.time() - last_activity_time) > 20:
                     logger.warning("[selenium] Silent freeze detected: Stop button visible but no activity for 20s")
+                    # Attempt page refresh before giving up — preserves session/cookies
+                    if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                        try:
+                            logger.info(
+                                "[selenium] Attempting page refresh for silent freeze recovery "
+                                "(attempt %d/%d)",
+                                self._page_refresh_attempts + 1,
+                                self._max_page_refresh_attempts,
+                            )
+                            driver.refresh()
+                            self._wait_for_page_ready(driver, timeout=30.0)
+                            # Invalidate cached selectors — DOM has changed after refresh
+                            self._cached_prompt_selector = None
+                            self._cached_send_selector = None
+                            self._page_refresh_attempts += 1
+                            raise RuntimeError(
+                                "page_refresh_required: silent freeze — page refreshed, retry without driver reset"
+                            )
+                        except Exception as refresh_err:
+                            logger.error("[selenium] Page refresh failed: %s", refresh_err)
+                            # Fall through to the original TimeoutException if refresh fails
                     raise TimeoutException("Silent freeze detected during generation")
 
                 if stable_counter >= 2:

@@ -7,6 +7,7 @@ import types
 import sys
 from typing import Any
 import pytest
+from selenium.common.exceptions import TimeoutException
 
 # Some environments may not have distutils installed for undetected_chromedriver.
 # Use a minimal fake module so unit tests can import core modules safely.
@@ -2132,6 +2133,107 @@ def test_wait_for_response_returns_best_effort_when_first_new_set(monkeypatch):
     # There is new text, so it should be returned (either from main loop or best-effort)
     # The exact return depends on timing, but it should not raise.
     assert result in ("new response text", "")
+
+
+def test_wait_for_response_silent_freeze_triggers_page_refresh(monkeypatch):
+    """_wait_for_response should attempt page refresh on silent freeze and raise page_refresh_required."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock, patch
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.stop_selectors = ["button.stop"]
+    engine._max_page_refresh_attempts = 2
+    engine._page_refresh_attempts = 0
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com"
+
+    # Simulate stop button visible but no response text ever appears
+    def fake_find_elements(by, selector):
+        if selector == "button.stop":
+            btn = MagicMock()
+            btn.is_displayed.return_value = True
+            return [btn]
+        return []
+
+    mock_driver.find_elements.side_effect = fake_find_elements
+
+    # Make refresh succeed and page ready return True
+    mock_driver.refresh = MagicMock()
+    engine._wait_for_page_ready = MagicMock(return_value=True)
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+
+    # Simulate that 25 seconds have elapsed since last activity so the
+    # silent-freeze condition (>20s) triggers immediately on the first iteration.
+    fake_time = [1000.0]
+
+    def fake_time_func():
+        return fake_time[0]
+
+    with patch("time.time", side_effect=fake_time_func), \
+         patch("time.sleep", lambda *_: None):
+        with pytest.raises(RuntimeError, match="page_refresh_required"):
+            engine._wait_for_response(mock_driver)
+
+    assert engine._page_refresh_attempts == 1
+    mock_driver.refresh.assert_called_once()
+    engine._wait_for_page_ready.assert_called_once_with(mock_driver, timeout=30.0)
+
+
+def test_wait_for_response_silent_freeze_resets_driver_after_max_refreshes(monkeypatch):
+    """_wait_for_response should raise TimeoutException after max page refresh attempts."""
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock, patch
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.stop_selectors = ["button.stop"]
+    engine._max_page_refresh_attempts = 1
+    engine._page_refresh_attempts = 1  # already at max
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com"
+
+    def fake_find_elements(by, selector):
+        if selector == "button.stop":
+            btn = MagicMock()
+            btn.is_displayed.return_value = True
+            return [btn]
+        return []
+
+    mock_driver.find_elements.side_effect = fake_find_elements
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+
+    # Simulate 25s elapsed so the freeze condition triggers immediately.
+    fake_time = [1000.0]
+
+    def fake_time_func():
+        return fake_time[0]
+
+    with patch("time.time", side_effect=fake_time_func), \
+         patch("time.sleep", lambda *_: None):
+        with pytest.raises(TimeoutException, match="Silent freeze detected"):
+            engine._wait_for_response(mock_driver)
+
+    # refresh should NOT be called because we are already at max attempts
+    mock_driver.refresh.assert_not_called()
 
 
 def test_wait_for_response_watcher_stable_container_returns_text(monkeypatch):
