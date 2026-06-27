@@ -710,6 +710,14 @@ async def openai_chat(req: Request) -> Any:
     else:
         raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
+    unsupported_openai_params = ["logprobs", "top_logprobs", "logit_bias", "n", "presence_penalty", "frequency_penalty"]
+    unsupported_present = [key for key in unsupported_openai_params if key in data]
+    if unsupported_present:
+        logger.warning(
+            "[openai_compat] Ignoring unsupported OpenAI parameters for Selenium engines: %s",
+            unsupported_present,
+        )
+
     stream = bool(data.get("stream", False))
 
     return await _prompt(

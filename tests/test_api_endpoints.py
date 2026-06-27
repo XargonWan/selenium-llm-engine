@@ -1169,6 +1169,24 @@ def test_token_count_nonzero():
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 
 
+def test_v1_chat_completions_ignores_unsupported_openai_params():
+    """Unsupported OpenAI parameters must be ignored rather than causing errors."""
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "logprobs": True,
+            "top_logprobs": 3,
+            "n": 2,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "chat.completion"
+    assert data["engine"] == "chatgpt"
+
+
 def test_v1_streaming_sse_format():
     """stream=True must return SSE with chat.completion.chunk objects."""
     with client.stream(
