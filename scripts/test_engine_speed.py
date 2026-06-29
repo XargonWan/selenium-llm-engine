@@ -1,6 +1,5 @@
 import time
 import requests
-import json
 import sys
 
 def test_speed(engine="gemini", prompt="Hello, how are you?"):

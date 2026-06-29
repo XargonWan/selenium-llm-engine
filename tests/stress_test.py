@@ -14,10 +14,8 @@ Invia prompt lunghi (3-4 chunk) con ramp-up per testare:
 import asyncio
 import json
 import time
-import sys
 import statistics
 from dataclasses import dataclass, field
-from typing import Any
 
 import httpx
 
@@ -354,7 +352,7 @@ async def run_stress_test():
         print(f"  Failed:           {len(stats.results) - len(stats.successful)}")
 
         if stats.successful:
-            print(f"  --- Timing (successful requests only) ---")
+            print("  --- Timing (successful requests only) ---")
             print(f"  Avg response:     {stats.avg_total_ms:.0f}ms ({stats.avg_total_ms/1000:.1f}s)")
             print(f"  Median response:  {stats.median_total_ms:.0f}ms ({stats.median_total_ms/1000:.1f}s)")
             print(f"  Min response:     {stats.min_total_ms:.0f}ms ({stats.min_total_ms/1000:.1f}s)")
@@ -366,7 +364,7 @@ async def run_stress_test():
 
         failures = [r for r in stats.results if not r.success]
         if failures:
-            print(f"  --- Failures ---")
+            print("  --- Failures ---")
             for f in failures:
                 print(f"    Prompt #{f.prompt_index+1}: {f.error[:100]}")
 
@@ -457,7 +455,7 @@ async def run_stress_test():
             f,
             indent=2,
         )
-    print(f"Detailed results saved to /tmp/stress_test_results.json")
+    print("Detailed results saved to /tmp/stress_test_results.json")
 
 
 if __name__ == "__main__":

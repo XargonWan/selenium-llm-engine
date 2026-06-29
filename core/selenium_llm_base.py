@@ -202,8 +202,12 @@ class SeleniumLLMBase:
         self._cached_prompt_selector: Optional[str] = None
         self._cached_send_selector: Optional[str] = None
 
-        # Prompt chunking: split prompts that exceed the model char limit
-        self._split_prompt_parts: int = max(1, int(os.getenv("SELENIUM_SPLIT_PROMPT_PARTS", "3")))
+        # Prompt chunking: split prompts that exceed the model char limit.
+        # This is a safety cap — the actual number of parts is computed
+        # dynamically from prompt length / model limit and never exceeds this.
+        # Default 10 is generous enough to handle very large prompts without
+        # creating too many tiny chunks.
+        self._split_prompt_parts: int = max(2, int(os.getenv("SELENIUM_SPLIT_PROMPT_PARTS", "10")))
         self._skip_split_for_next: bool = False
 
         # Per-engine response timeout override (seconds).  Set by JsonEngine from the
@@ -220,6 +224,10 @@ class SeleniumLLMBase:
         # If the uc.Chrome session dies after initialization, prefer the
         # standard webdriver.Chrome fallback on the next driver init attempt.
         self._prefer_webdriver_fallback: bool = False
+
+        # Per-engine total timeout override (seconds). Set by JsonEngine from
+        # the JSON config key "total_timeout". None means use the computed default.
+        self._total_timeout: int | None = None
 
         # Some engines (Gemini) work more reliably when response detection uses
         # stable text instead of comparing against prior baseline text.
@@ -721,13 +729,16 @@ class SeleniumLLMBase:
             300 s (5 min), overridable via the ``SELENIUM_TOTAL_TIMEOUT``
             environment variable.
         """
-        # Compute effective timeout: per-call > env var > default 300s (5 min)
+        # Compute effective timeout: per-call > per-engine from JSON > env var > computed default
         if timeout is not None:
             total_timeout = int(timeout)
+        elif self._total_timeout is not None:
+            total_timeout = self._total_timeout
+        elif os.getenv("SELENIUM_TOTAL_TIMEOUT"):
+            total_timeout = int(os.getenv("SELENIUM_TOTAL_TIMEOUT"))
         else:
             effective_max_wait = self._response_max_wait or 120
-            default_timeout = effective_max_wait + 180  # generous overhead
-            total_timeout = int(os.getenv("SELENIUM_TOTAL_TIMEOUT", str(default_timeout)))
+            total_timeout = effective_max_wait + 180  # generous overhead
 
         try:
             result = await asyncio.wait_for(

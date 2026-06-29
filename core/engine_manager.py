@@ -374,7 +374,11 @@ class EngineManager:
         result = []
         for desc in self._descriptors.values():
             if desc.name not in seen:
-                result.append(desc.to_dict())
+                entry = desc.to_dict()
+                # Include queue depth for live engines
+                queue = self._job_queues.get(desc.name)
+                entry["queue_depth"] = queue.qsize() if queue else 0
+                result.append(entry)
                 seen.add(desc.name)
         return result
 
