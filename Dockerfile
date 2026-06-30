@@ -54,7 +54,10 @@ RUN ARCH="${TARGETARCH}" && \
     echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list.d/debian-chromium.list && \
     echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://security.debian.org/debian-security bookworm-security main" >> /etc/apt/sources.list.d/debian-chromium.list && \
     apt-get update && \
-    CHROMIUM_VERSION=$(apt-cache policy chromium | awk '/Candidate:/ {print $2}') && \
+    # Hard-pinned to a version compatible with undetected-chromedriver 3.5.5.
+    # Bump this when both Chromium AND undetected-chromedriver have been
+    # verified together.  Do NOT revert to dynamic candidate resolution.
+    CHROMIUM_VERSION="149.0.7827.196-1~deb12u1" && \
     apt-get install -y --no-install-recommends chromium=$CHROMIUM_VERSION chromium-driver=$CHROMIUM_VERSION && \
     apt-mark hold chromium chromium-driver && \
     rm -f /etc/apt/sources.list.d/debian-chromium.list && \

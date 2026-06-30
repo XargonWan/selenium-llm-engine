@@ -444,7 +444,19 @@ class SeleniumLLMBase:
             max_retries = 3
             self.driver = None
             last_err: Optional[Exception] = None
-            for attempt in range(max_retries):
+
+            # Auto-detect: undetected_chromedriver 3.5.5 does not support
+            # Chromium >= 149.  Skip straight to the browser's native driver.
+            if chromium_major is not None and chromium_major >= 149:
+                logger.info(
+                    "[selenium] Chromium %d detected — skipping uc.Chrome "
+                    "(unsupported by undetected_chromedriver 3.5.5), "
+                    "using webdriver.Chrome directly",
+                    chromium_major,
+                )
+                self._prefer_webdriver_fallback = True
+
+            for attempt in range(max_retries if not self._prefer_webdriver_fallback else 0):
                 options = self._build_options()
                 options.binary_location = chromium_binary
                 try:
@@ -1062,6 +1074,27 @@ class SeleniumLLMBase:
                             "redirect-stall: final chunk not accepted by UI after send"
                         )
                     response = self._wait_for_response(driver)
+
+                    # ── post-response cleanup ────────────────────────────────
+                    # Same as in _sync_generate_response_once: if the stop button
+                    # is still visible after a successful response, refresh the
+                    # page so the next request starts clean.
+                    try:
+                        if self._stop_button_present(driver):
+                            logger.info(
+                                "[selenium] Stop button still visible after chunked "
+                                "response detection — refreshing page for clean state"
+                            )
+                            driver.refresh()
+                            self._wait_for_page_ready(driver, timeout=30.0)
+                            self._cached_prompt_selector = None
+                            self._cached_send_selector = None
+                    except Exception as refresh_err:
+                        logger.warning(
+                            "[selenium] Post-chunked-response cleanup refresh failed: %s",
+                            refresh_err,
+                        )
+
                     logger.info(
                         f"[timing] chunk {idx}/{n} (final) response: {time.time() - chunk_start:.2f}s"
                     )
@@ -1187,6 +1220,11 @@ class SeleniumLLMBase:
 
     def _sync_generate_response_once(self, prompt: str, media: list[Any] | None = None) -> str:
         """Single attempt of the core generate flow."""
+        # Reset the page-refresh budget once per generate attempt so that stale
+        # counters from a previous request don't block page recovery for the
+        # current one.
+        self._page_refresh_attempts = 0
+
         t0 = time.time()
         self._ensure_ready()
 
@@ -1299,6 +1337,28 @@ class SeleniumLLMBase:
                 logger.info(f"[timing] post_send_check: {t5 - t4:.2f}s")
 
                 response = self._wait_for_response(driver)
+
+                # ── post-response cleanup ────────────────────────────────────
+                # If the stop button is still visible after a successful response
+                # detection (the UI framework may keep it visible briefly or
+                # indefinitely when stuck), refresh the page so the next request
+                # starts with a clean slate.
+                try:
+                    if self._stop_button_present(driver):
+                        logger.info(
+                            "[selenium] Stop button still visible after response "
+                            "detection — refreshing page for clean state"
+                        )
+                        driver.refresh()
+                        self._wait_for_page_ready(driver, timeout=30.0)
+                        self._cached_prompt_selector = None
+                        self._cached_send_selector = None
+                except Exception as refresh_err:
+                    logger.warning(
+                        "[selenium] Post-response cleanup refresh failed: %s",
+                        refresh_err,
+                    )
+
                 t6 = time.time()
                 logger.info(f"[timing] wait_for_response: {t6 - t5:.2f}s")
                 logger.info(f"[timing] TOTAL generate: {t6 - t0:.2f}s")
