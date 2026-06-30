@@ -103,7 +103,12 @@
       ".stop-button",
       "[data-testid='stop-button']",
       "mat-icon[fonticon='stop']",
-      "button mat-icon[fonticon='stop']"
+      "button mat-icon[fonticon='stop']",
+      "gem-icon-button button:has(mat-icon[fonticon='stop'])",
+      "div.send-button-container.visible button:has(mat-icon[fonticon='stop'])",
+      "button:has(> gem-icon > mat-icon[fonticon='stop'])",
+      "mat-icon[aria-label='Stop']",
+      "mat-icon[data-mat-icon-name='stop']"
     ]
   },
   "media_support": {
