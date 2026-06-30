@@ -253,6 +253,19 @@ class SeleniumLLMBase:
         # trained JSON/action schema instead of plain descriptive text.
         self._vision_prompt_prefix: str = ""
 
+        # Optional prefix prepended to the prompt when NO media items are present.
+        # Useful to instruct the LLM to respond inline (e.g. avoid canvas/document
+        # mode) and to prevent the engine from entering a stuck state that shows
+        # "Something went wrong" errors.
+        # Can be overridden per-engine via the "inline_response_prefix" JSON key.
+        self._inline_response_prefix: str = (
+            "IMPORTANT: Always respond inline, do NOT use canvas, documents, or "
+            "any separate UI mode. Write the full response directly in this chat "
+            "as plain text. Do NOT activate canvas, artifacts, or separate "
+            "documents. The response must be complete and self-contained within "
+            "this chat window.\n\n"
+        )
+
     def get_supported_models(self) -> list[str]:
         return list(self.model_limits_map.keys())
 
@@ -816,6 +829,39 @@ class SeleniumLLMBase:
         """Return True if *exc* signals that a page refresh was performed due to silent freeze."""
         return "page_refresh_required" in str(exc)
 
+    def _is_engine_error_response(self, text: str) -> bool:
+        """Return True if *text* looks like an LLM web UI error rather than a valid response.
+
+        Detects common error patterns displayed by LLM web interfaces (e.g.
+        "Something went wrong", "Something went wrong (13)", etc.) so they
+        can be treated as transient failures and retried.
+        """
+        if not text:
+            return False
+        stripped = text.strip()
+        # Common error patterns from LLM web UIs
+        error_patterns = [
+            "something went wrong",
+            "qualcosa è andato storto",
+            "an error occurred",
+            "si è verificato un errore",
+            "internal server error",
+            "errore interno del server",
+            "request failed",
+            "richiesta fallita",
+            "service unavailable",
+            "servizio non disponibile",
+        ]
+        lower = stripped.lower()
+        for pattern in error_patterns:
+            if pattern in lower:
+                logger.warning(
+                    "[selenium] Detected engine error response: %r",
+                    stripped[:200],
+                )
+                return True
+        return False
+
     def _quit_driver_with_timeout(self, driver: Any, timeout: int = 5) -> None:
         """Attempt ``driver.quit()`` with a hard timeout.
 
@@ -1290,6 +1336,12 @@ class SeleniumLLMBase:
             # responds in plain text rather than the trained JSON/action schema.
             if self._vision_prompt_prefix:
                 prompt = self._vision_prompt_prefix + prompt
+        else:
+            # When no media is present, prepend the inline response prefix to
+            # instruct the LLM to respond inline (e.g. avoid canvas/document
+            # mode) and prevent stuck states that show "Something went wrong".
+            if self._inline_response_prefix:
+                prompt = self._inline_response_prefix + prompt
 
         # Prompt chunking: split oversized prompts into sequential parts.
         if not self._skip_split_for_next and not media and self._should_split_prompt(prompt):
@@ -1337,6 +1389,23 @@ class SeleniumLLMBase:
                 logger.info(f"[timing] post_send_check: {t5 - t4:.2f}s")
 
                 response = self._wait_for_response(driver)
+
+                # ── engine error detection ───────────────────────────────────
+                # If the response text looks like an LLM web UI error (e.g.
+                # "Something went wrong (13)"), treat it as a transient failure
+                # and raise so the retry loop in _sync_generate_response can
+                # reset the driver and try again.
+                if self._is_engine_error_response(response):
+                    logger.warning(
+                        "[selenium] Engine error detected in response: %r — "
+                        "raising for retry with driver reset",
+                        response[:200],
+                    )
+                    self._reset_driver()
+                    raise RuntimeError(
+                        "selenium_response_detection_timeout: engine error "
+                        "response detected — driver reset for retry"
+                    )
 
                 # ── post-response cleanup ────────────────────────────────────
                 # If the stop button is still visible after a successful response

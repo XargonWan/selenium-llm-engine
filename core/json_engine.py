@@ -144,6 +144,8 @@ class JsonEngine(SeleniumLLMBase):
             self._use_baseline_comparison = bool(config["use_baseline_comparison"])
         if "vision_prompt_prefix" in config:
             self._vision_prompt_prefix = str(config["vision_prompt_prefix"])
+        if "inline_response_prefix" in config:
+            self._inline_response_prefix = str(config["inline_response_prefix"])
 
         # ------------------------------------------------------------------ media support
         self.media_config: dict[str, Any] = config.get("media_support", {})
