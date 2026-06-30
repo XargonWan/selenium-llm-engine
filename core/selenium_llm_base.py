@@ -2275,7 +2275,57 @@ class SeleniumLLMBase:
 
         Retries stale element references and transient failures to avoid dropped
         prompts where the UI updates between finding and clicking the button.
+
+        If the stop button is visible when this method is called (meaning a
+        previous generation is still in progress), wait for it to disappear
+        before attempting to find and click the send button.  This prevents the
+        method from spending 30+ seconds polling for a send button that cannot
+        appear until the running generation finishes.
         """
+        # Pre-check: if the stop button is visible, the LLM is still generating
+        # from a previous request.  Wait for it to finish first.
+        if self._stop_button_present(driver):
+            logger.info(
+                "[selenium] _click_send: stop button visible (previous generation in progress), "
+                "waiting for it to disappear before sending…"
+            )
+            wait_deadline = time.time() + 30.0
+            while time.time() < wait_deadline:
+                if not self._stop_button_present(driver):
+                    logger.info("[selenium] _click_send: stop button disappeared, generation complete")
+                    break
+                time.sleep(0.5)
+            else:
+                logger.warning(
+                    "[selenium] _click_send: stop button did not disappear within 30s — refreshing page"
+                )
+                if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                    try:
+                        driver.refresh()
+                    except Exception as refresh_err:
+                        logger.warning(
+                            "[selenium] _click_send driver.refresh() failed: %s",
+                            refresh_err,
+                        )
+                    self._wait_for_page_ready(driver, timeout=30.0)
+                    self._cached_prompt_selector = None
+                    self._cached_send_selector = None
+                    self._page_refresh_attempts += 1
+                    logger.info(
+                        "[selenium] _click_send: page refreshed (attempt %d/%d), retrying",
+                        self._page_refresh_attempts,
+                        self._max_page_refresh_attempts,
+                    )
+                    raise RuntimeError(
+                        "page_refresh_required: stop button stuck before send — "
+                        "page refreshed, retry without driver reset"
+                    )
+                else:
+                    logger.warning(
+                        "[selenium] _click_send: max page refresh attempts (%d) reached, proceeding anyway",
+                        self._max_page_refresh_attempts,
+                    )
+
         max_attempts = int(os.getenv("SELENIUM_SEND_CLICK_RETRIES", "1"))
 
         def _is_button_blacklisted(btn: Any) -> bool:
@@ -2567,6 +2617,52 @@ class SeleniumLLMBase:
            assume generation has finished.
         """
         self._click_accept_buttons(driver, timeout=2.0)
+
+        # Pre-check: if the stop button is visible right now, this means
+        # _post_send_check accepted a stale stop button as "generation started"
+        # but actually the page is stuck from a previous generation.
+        if self._stop_button_present(driver):
+            logger.warning(
+                "[selenium] _wait_for_response: stop button already visible at start — "
+                "page may be stuck from previous generation"
+            )
+            # Give it a brief chance to settle before assuming stuck
+            settle_deadline = time.time() + 3.0
+            while time.time() < settle_deadline:
+                if not self._stop_button_present(driver):
+                    break
+                time.sleep(0.5)
+            else:
+                # Stop button persisted for 3s — it's stuck. Refresh.
+                if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                    logger.info(
+                        "[selenium] _wait_for_response: refreshing page due to stuck "
+                        "stop button at start (attempt %d/%d)",
+                        self._page_refresh_attempts + 1,
+                        self._max_page_refresh_attempts,
+                    )
+                    try:
+                        driver.refresh()
+                    except Exception as refresh_err:
+                        logger.warning(
+                            "[selenium] _wait_for_response driver.refresh() failed: %s",
+                            refresh_err,
+                        )
+                    self._wait_for_page_ready(driver, timeout=30.0)
+                    self._cached_prompt_selector = None
+                    self._cached_send_selector = None
+                    self._page_refresh_attempts += 1
+                    raise RuntimeError(
+                        "page_refresh_required: stop button stuck at start of "
+                        "_wait_for_response — page refreshed, retry without driver reset"
+                    )
+                else:
+                    logger.warning(
+                        "[selenium] _wait_for_response: max page refresh attempts (%d) reached "
+                        "with stuck stop button at start, continuing anyway",
+                        self._max_page_refresh_attempts,
+                    )
+
         baseline = ""
         if self._use_baseline_comparison:
             baseline = self._get_latest_response_text(driver)
@@ -2575,6 +2671,10 @@ class SeleniumLLMBase:
             logger.debug("[selenium] Skipping baseline comparison for this engine")
 
         self._generation_was_active = False
+
+        # Reset last_activity_time after potential refresh so the freeze detection
+        # doesn't inherit stale timing from a previous generation cycle.
+        last_activity_time = time.time()
 
         logger.debug("[selenium] watcher initial delay: 3.0s before response monitoring")
         time.sleep(3.0)
@@ -2590,6 +2690,8 @@ class SeleniumLLMBase:
         iteration = 0
         last_container = None
         last_activity_time = time.time()
+        current_text_length = 0
+        current_child_count = 0
 
         while time.time() < deadline:
             iteration += 1
@@ -2634,43 +2736,14 @@ class SeleniumLLMBase:
                         self._generation_was_active = True
                         last_activity_time = time.time()
                     elif current_text_length > 0 or current_child_count > 0:
-                        if not baseline or self._extract_response_text_from_element(
-                            driver, container
-                        ) != baseline:
-                            stable_counter += 1
-                        else:
-                            stable_counter = 0
+                        # Text is present and stable (not changing between iterations).
+                        # This is the key condition: if text stays the same for 2+ iterations,
+                        # generation is complete or stuck.
+                        stable_counter += 1
                     else:
                         stable_counter = 0
                 previous_text_length = current_text_length
                 previous_child_count = current_child_count
-
-                # Early freeze detection: if the "Stop" button is present but
-                # there's been no text expansion for > 20s, it's a silent hang.
-                if self._stop_button_present(driver) and (time.time() - last_activity_time) > 20:
-                    logger.warning("[selenium] Silent freeze detected: Stop button visible but no activity for 20s")
-                    # Attempt page refresh before giving up — preserves session/cookies
-                    if self._page_refresh_attempts < self._max_page_refresh_attempts:
-                        try:
-                            logger.info(
-                                "[selenium] Attempting page refresh for silent freeze recovery "
-                                "(attempt %d/%d)",
-                                self._page_refresh_attempts + 1,
-                                self._max_page_refresh_attempts,
-                            )
-                            driver.refresh()
-                            self._wait_for_page_ready(driver, timeout=30.0)
-                            # Invalidate cached selectors — DOM has changed after refresh
-                            self._cached_prompt_selector = None
-                            self._cached_send_selector = None
-                            self._page_refresh_attempts += 1
-                            raise RuntimeError(
-                                "page_refresh_required: silent freeze — page refreshed, retry without driver reset"
-                            )
-                        except Exception as refresh_err:
-                            logger.error("[selenium] Page refresh failed: %s", refresh_err)
-                            # Fall through to the original TimeoutException if refresh fails
-                    raise TimeoutException("Silent freeze detected during generation")
 
                 if stable_counter >= 2:
                     response = self._extract_response_text_from_element(driver, container)
@@ -2680,6 +2753,54 @@ class SeleniumLLMBase:
                             iteration,
                         )
                         return response
+
+            # Early freeze detection — checked EVERY iteration regardless of container presence.
+            # When the response container is not found (selectors don't match the stuck page),
+            # the code used to loop forever because this detection was inside the `else` block.
+            # Now it runs unconditionally.
+            silent_freeze_threshold = float(os.getenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10"))
+            is_silent_freeze = (
+                self._stop_button_present(driver) 
+                and (time.time() - last_activity_time) > silent_freeze_threshold
+            )
+            is_ui_stuck = (
+                self._stop_button_present(driver) 
+                and stable_counter >= 2 
+                and (current_text_length > 0 or current_child_count > 0)
+            )
+
+            if is_silent_freeze or is_ui_stuck:
+                freeze_reason = "silent freeze" if is_silent_freeze else "UI stuck after completion"
+                logger.warning(
+                    "[selenium] %s detected: Stop button visible but no proper UI transition (inactive %.1fs, text_len=%d, stable=%d)",
+                    freeze_reason,
+                    time.time() - last_activity_time,
+                    current_text_length,
+                    stable_counter,
+                )
+                # Attempt page refresh before giving up — preserves session/cookies
+                if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                    try:
+                        logger.info(
+                            "[selenium] Attempting page refresh for %s recovery "
+                            "(attempt %d/%d)",
+                            freeze_reason,
+                            self._page_refresh_attempts + 1,
+                            self._max_page_refresh_attempts,
+                        )
+                        driver.refresh()
+                        self._wait_for_page_ready(driver, timeout=30.0)
+                        # Invalidate cached selectors — DOM has changed after refresh
+                        self._cached_prompt_selector = None
+                        self._cached_send_selector = None
+                        self._page_refresh_attempts += 1
+                        raise RuntimeError(
+                            "page_refresh_required: %s — page refreshed, retry without driver reset" % freeze_reason
+                        )
+                    except Exception as refresh_err:
+                        logger.error("[selenium] Page refresh failed: %s", refresh_err)
+                        # Fall through to the original TimeoutException if refresh fails
+                raise TimeoutException("%s detected during generation" % freeze_reason)
 
             if self._is_limit_present(driver):
                 raise RuntimeError(
