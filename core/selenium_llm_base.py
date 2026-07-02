@@ -233,6 +233,14 @@ class SeleniumLLMBase:
         # stable text instead of comparing against prior baseline text.
         self._use_baseline_comparison: bool = True
 
+        # Per-engine "silent freeze" threshold (seconds): how long the stop button
+        # may stay visible with no response-text activity before the page is
+        # considered stuck.  Engines that render the whole answer in one block
+        # (no incremental streaming, e.g. Gemini) need a larger value so that the
+        # initial "thinking" delay isn't mistaken for a freeze.  None means use
+        # the SELENIUM_SILENT_FREEZE_THRESHOLD env default.
+        self._silent_freeze_threshold: float | None = None
+
         # Silent freeze recovery: track page refresh attempts before driver reset
         self._page_refresh_attempts: int = 0
         self._max_page_refresh_attempts: int = int(os.getenv("SELENIUM_MAX_PAGE_REFRESH", "2"))
@@ -2754,50 +2762,19 @@ class SeleniumLLMBase:
         """
         self._click_accept_buttons(driver, timeout=2.0)
 
-        # Pre-check: if the stop button is visible right now, this means
-        # _post_send_check accepted a stale stop button as "generation started"
-        # but actually the page is stuck from a previous generation.
-        if self._stop_button_present(driver):
-            logger.warning(
-                "[selenium] _wait_for_response: stop button already visible at start — "
-                "page may be stuck from previous generation"
-            )
-            # Give it a brief chance to settle before assuming stuck
-            settle_deadline = time.time() + 3.0
-            while time.time() < settle_deadline:
-                if not self._stop_button_present(driver):
-                    break
-                time.sleep(0.5)
-            else:
-                # Stop button persisted for 3s — it's stuck. Refresh.
-                if self._page_refresh_attempts < self._max_page_refresh_attempts:
-                    logger.info(
-                        "[selenium] _wait_for_response: refreshing page due to stuck "
-                        "stop button at start (attempt %d/%d)",
-                        self._page_refresh_attempts + 1,
-                        self._max_page_refresh_attempts,
-                    )
-                    try:
-                        driver.refresh()
-                    except Exception as refresh_err:
-                        logger.warning(
-                            "[selenium] _wait_for_response driver.refresh() failed: %s",
-                            refresh_err,
-                        )
-                    self._wait_for_page_ready(driver, timeout=30.0)
-                    self._cached_prompt_selector = None
-                    self._cached_send_selector = None
-                    self._page_refresh_attempts += 1
-                    raise RuntimeError(
-                        "page_refresh_required: stop button stuck at start of "
-                        "_wait_for_response — page refreshed, retry without driver reset"
-                    )
-                else:
-                    logger.warning(
-                        "[selenium] _wait_for_response: max page refresh attempts (%d) reached "
-                        "with stuck stop button at start, continuing anyway",
-                        self._max_page_refresh_attempts,
-                    )
+        # NOTE: A stop button visible at the start of _wait_for_response does NOT
+        # by itself mean the page is stuck. Many engines (e.g. Gemini) render the
+        # whole answer in one block after a "thinking" delay, so the stop button
+        # legitimately stays visible for a while before any text appears.
+        # Refreshing on a bare stop-button presence would throw away a response
+        # that is still being generated and cause an infinite paste → send →
+        # refresh loop.
+        #
+        # Stuck-page detection is therefore delegated entirely to the main
+        # monitoring loop below, which distinguishes a genuine freeze from active
+        # generation by watching the response text: it only refreshes when the
+        # stop button is visible AND no text activity has occurred for the
+        # engine's silent-freeze threshold (see `is_silent_freeze`).
 
         baseline = ""
         if self._use_baseline_comparison:
@@ -2894,7 +2871,11 @@ class SeleniumLLMBase:
             # When the response container is not found (selectors don't match the stuck page),
             # the code used to loop forever because this detection was inside the `else` block.
             # Now it runs unconditionally.
-            silent_freeze_threshold = float(os.getenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10"))
+            silent_freeze_threshold = self._silent_freeze_threshold
+            if silent_freeze_threshold is None:
+                silent_freeze_threshold = float(
+                    os.getenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10")
+                )
             is_silent_freeze = (
                 self._stop_button_present(driver) 
                 and (time.time() - last_activity_time) > silent_freeze_threshold
@@ -2916,6 +2897,7 @@ class SeleniumLLMBase:
                 )
                 # Attempt page refresh before giving up — preserves session/cookies
                 if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                    refreshed = False
                     try:
                         logger.info(
                             "[selenium] Attempting page refresh for %s recovery "
@@ -2930,12 +2912,18 @@ class SeleniumLLMBase:
                         self._cached_prompt_selector = None
                         self._cached_send_selector = None
                         self._page_refresh_attempts += 1
-                        raise RuntimeError(
-                            "page_refresh_required: %s — page refreshed, retry without driver reset" % freeze_reason
-                        )
+                        refreshed = True
                     except Exception as refresh_err:
                         logger.error("[selenium] Page refresh failed: %s", refresh_err)
                         # Fall through to the original TimeoutException if refresh fails
+                    # Raise the retry signal *outside* the try/except so it isn't
+                    # swallowed by the ``except Exception`` above (which would
+                    # otherwise degrade it into a plain TimeoutException and
+                    # prevent the caller from retrying without a driver reset).
+                    if refreshed:
+                        raise RuntimeError(
+                            "page_refresh_required: %s — page refreshed, retry without driver reset" % freeze_reason
+                        )
                 raise TimeoutException("%s detected during generation" % freeze_reason)
 
             if self._is_limit_present(driver):

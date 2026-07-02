@@ -142,6 +142,13 @@ class JsonEngine(SeleniumLLMBase):
             self._total_timeout = int(config["total_timeout"])
         if "use_baseline_comparison" in config:
             self._use_baseline_comparison = bool(config["use_baseline_comparison"])
+        # Optional JSON key "silent_freeze_threshold" (seconds): how long the stop
+        # button may remain visible with no response-text activity before the page
+        # is considered stuck. Engines that emit the whole answer in one block
+        # (no incremental streaming, e.g. Gemini) need a larger value so the
+        # initial thinking delay isn't mistaken for a freeze.
+        if "silent_freeze_threshold" in config:
+            self._silent_freeze_threshold = float(config["silent_freeze_threshold"])
         if "vision_prompt_prefix" in config:
             self._vision_prompt_prefix = str(config["vision_prompt_prefix"])
         if "inline_response_prefix" in config:

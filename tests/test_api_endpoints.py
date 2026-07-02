@@ -2246,13 +2246,18 @@ def test_wait_for_response_silent_freeze_triggers_page_refresh(monkeypatch):
     engine._wait_for_page_ready = MagicMock(return_value=True)
 
     monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
-    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
+    # Low freeze threshold so the silent-freeze condition triggers quickly once
+    # the (advancing) fake clock passes it.
+    monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "5")
 
-    # Simulate that 25 seconds have elapsed since last activity so the
-    # silent-freeze condition (>20s) triggers immediately on the first iteration.
+    # Advance the fake clock a little on every time.time() call so the main
+    # monitoring loop makes progress and eventually crosses the freeze threshold
+    # while staying well under the (large) max_wait deadline.
     fake_time = [1000.0]
 
     def fake_time_func():
+        fake_time[0] += 1.0
         return fake_time[0]
 
     with patch("time.time", side_effect=fake_time_func), \
@@ -2295,21 +2300,81 @@ def test_wait_for_response_silent_freeze_resets_driver_after_max_refreshes(monke
     mock_driver.find_elements.side_effect = fake_find_elements
 
     monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
-    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
+    monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "5")
 
-    # Simulate 25s elapsed so the freeze condition triggers immediately.
+    # Advance the fake clock on every call so the loop progresses and crosses the
+    # freeze threshold while staying under max_wait.
     fake_time = [1000.0]
 
     def fake_time_func():
+        fake_time[0] += 1.0
         return fake_time[0]
 
     with patch("time.time", side_effect=fake_time_func), \
          patch("time.sleep", lambda *_: None):
-        with pytest.raises(TimeoutException, match="Silent freeze detected"):
+        with pytest.raises(TimeoutException, match="silent freeze detected"):
             engine._wait_for_response(mock_driver)
 
     # refresh should NOT be called because we are already at max attempts
     mock_driver.refresh.assert_not_called()
+
+
+def test_wait_for_response_block_generation_with_stop_button_does_not_refresh(monkeypatch):
+    """Block-generation engines must not trigger a page refresh at start.
+
+    Regression: some engines (e.g. Gemini) render the whole answer in one block
+    after a thinking delay, keeping the stop button visible the entire time with
+    no incremental text. The old start-of-wait pre-check refreshed the page when
+    the stop button stayed visible for a few seconds, discarding the in-progress
+    response and causing an infinite paste → send → refresh loop.
+
+    _wait_for_response must instead let the response arrive and return it,
+    without ever calling driver.refresh().
+    """
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.stop_selectors = ["button.stop"]
+    engine.accept_button_selectors = []
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+    # Stop button stays visible throughout the whole block generation.
+    engine._stop_button_present = lambda driver: True
+
+    fake_element = MagicMock()
+    # No text for the first few polls (thinking), then the whole block appears
+    # and stays stable — mimicking non-incremental generation.
+    stats = [(0, 0), (0, 0), (120, 3), (120, 3), (120, 3)]
+    call_count = {"n": 0}
+
+    def fake_get_stats(_driver, _element):
+        call_count["n"] += 1
+        return stats[min(call_count["n"] - 1, len(stats) - 1)]
+
+    engine._find_response_container_element = lambda driver: (fake_element, "div.response")
+    engine._get_response_container_stats = fake_get_stats
+    engine._extract_response_text_from_element = lambda driver, element: "block response"
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com"
+
+    with monkeypatch.context() as m:
+        m.setattr("time.sleep", lambda *_: None)
+        result = engine._wait_for_response(mock_driver, max_wait=10)
+
+    assert result == "block response"
+    mock_driver.refresh.assert_not_called()
+    assert engine._page_refresh_attempts == 0
 
 
 def test_wait_for_response_watcher_stable_container_returns_text(monkeypatch):
