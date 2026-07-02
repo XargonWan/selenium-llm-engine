@@ -1168,6 +1168,11 @@ class SeleniumLLMBase:
     def _sync_generate_response(self, prompt: str, media: list[Any] | None = None) -> str:
         """Synchronous core of generate_response — runs in a worker thread."""
         max_attempts = 5
+        # Reset the page-refresh budget once per *request* (not per attempt) so
+        # that stuck-stop-button refreshes accumulate across retries. Resetting
+        # it inside every attempt would let the budget replenish each cycle and
+        # cause an infinite paste → send → refresh loop.
+        self._page_refresh_attempts = 0
         for attempt in range(max_attempts):
             try:
                 try:
@@ -1265,12 +1270,14 @@ class SeleniumLLMBase:
         raise RuntimeError("_sync_generate_response exhausted retries")
 
     def _sync_generate_response_once(self, prompt: str, media: list[Any] | None = None) -> str:
-        """Single attempt of the core generate flow."""
-        # Reset the page-refresh budget once per generate attempt so that stale
-        # counters from a previous request don't block page recovery for the
-        # current one.
-        self._page_refresh_attempts = 0
+        """Single attempt of the core generate flow.
 
+        Note: ``_page_refresh_attempts`` is intentionally *not* reset here. The
+        budget is reset once per request in ``_sync_generate_response`` so that
+        stuck-stop-button page refreshes accumulate across attempts and can
+        eventually exhaust the budget (triggering a driver reset) instead of
+        looping forever.
+        """
         t0 = time.time()
         self._ensure_ready()
 

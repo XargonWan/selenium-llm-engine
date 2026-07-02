@@ -2012,6 +2012,64 @@ def test_sync_generate_response_retries_on_redirect_stall():
     assert reset_called == [], "Driver must NOT be reset on redirect-stall"
 
 
+def test_sync_generate_response_page_refresh_budget_persists_across_attempts():
+    """A perpetually-stuck stop button must not cause an infinite refresh loop.
+
+    Regression: _page_refresh_attempts was reset to 0 at the start of every
+    _sync_generate_response_once, so the page-refresh budget replenished on each
+    attempt and the paste → send → refresh cycle never terminated. The budget
+    must be reset once per request and shared across attempts, so that once it
+    is exhausted the engine falls back to a driver reset instead of looping.
+    """
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine._max_page_refresh_attempts = 2
+
+    call_count = 0
+    reset_called = []
+
+    def fake_once(prompt):
+        nonlocal call_count
+        call_count += 1
+        # Simulate _wait_for_response detecting a stuck stop button: it bumps the
+        # refresh counter (up to the budget) then raises page_refresh_required.
+        if engine._page_refresh_attempts < engine._max_page_refresh_attempts:
+            engine._page_refresh_attempts += 1
+        raise RuntimeError(
+            "page_refresh_required: stop button stuck at start of "
+            "_wait_for_response — page refreshed, retry without driver reset"
+        )
+
+    engine._sync_generate_response_once = fake_once
+
+    def fake_reset():
+        reset_called.append(True)
+        # A real driver reset also clears the refresh counter; mirror that here.
+        engine._page_refresh_attempts = 0
+        # After the reset the page is clean, so the next attempt succeeds.
+        engine._sync_generate_response_once = lambda prompt: "recovered"
+
+    engine._reset_driver = fake_reset
+
+    result = engine._sync_generate_response("hello")
+
+    assert result == "recovered"
+    # Once the budget is exhausted the engine resets the driver exactly once.
+    assert reset_called == [True], "Driver must be reset once budget is exhausted"
+    # fake_once is invoked twice: attempt 1 (budget 0→1, retry) and attempt 2
+    # (budget 1→2 → exhausted → driver reset). The reset swaps in the recovery
+    # stub, so attempt 3 succeeds without incrementing call_count. Because the
+    # budget persists across attempts, the loop terminates instead of spinning.
+    assert call_count == 2
+
+
 def test_sync_generate_response_retries_on_response_detection_timeout():
     """_sync_generate_response retries with driver reset when response detection times out."""
     import tempfile
