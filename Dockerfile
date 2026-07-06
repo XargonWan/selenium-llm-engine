@@ -45,24 +45,41 @@ RUN echo 'Package: snapd' > /etc/apt/preferences.d/no-snap && \
 # Install gemini-cli (optional helper, same as Synthetic Heart)
 RUN pip3 install --no-cache-dir gemini-cli || true
 
-# Install Chromium from Debian repos if not preinstalled
-RUN ARCH="${TARGETARCH}" && \
-    if [ -z "$ARCH" ]; then ARCH=amd64; fi && \
-    apt-get update && \
+# Install Chromium 148 fully offline from vendored .deb files.
+#
+# undetected-chromedriver 3.5.5 only supports Chromium <= 148. Debian
+# bookworm-security no longer ships 148 (only 150 is available now), so we
+# vendor the exact 148 .deb packages in the repo and install them from disk.
+# This keeps undetected-chromedriver's stealth path (uc.Chrome) working; do
+# NOT bump to 150 without also upgrading undetected-chromedriver, or the
+# engine falls back to the non-stealth native webdriver.
+#
+# The .deb packages are Debian bookworm builds, but the base image is Ubuntu
+# Noble, so their runtime deps use Debian package names that Noble lacks
+# (libdav1d6, libdouble-conversion3, libharfbuzz-subset0, libjpeg62-turbo,
+# libminizip1, libopenh264-7, libxnvctrl0). Rather than depend on the Debian
+# repos being reachable at build time, we ALSO vendor those dependency .deb
+# files under vendor/chromium148/deps/ so the entire install is offline and
+# reproducible even if the Debian bookworm repos ever disappear.
+#
+# Pinned: chromium / chromium-common / chromium-driver 148.0.7778.215-1~deb12u1
+COPY vendor/chromium148/ /tmp/chromium148/
+RUN apt-get update && \
     apt-get purge -y google-chrome google-chrome-stable || true && \
-    apt-get install -y --no-install-recommends debian-archive-keyring && \
-    echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list.d/debian-chromium.list && \
-    echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://security.debian.org/debian-security bookworm-security main" >> /etc/apt/sources.list.d/debian-chromium.list && \
-    apt-get update && \
-    # Hard-pinned to a version compatible with undetected-chromedriver 3.5.5.
-    # Bump this when both Chromium AND undetected-chromedriver have been
-    # verified together.  Do NOT revert to dynamic candidate resolution.
-    CHROMIUM_VERSION="149.0.7827.196-1~deb12u1" && \
-    apt-get install -y --no-install-recommends chromium=$CHROMIUM_VERSION chromium-driver=$CHROMIUM_VERSION && \
-    apt-mark hold chromium chromium-driver && \
-    rm -f /etc/apt/sources.list.d/debian-chromium.list && \
+    # Install the vendored Debian-flavoured runtime deps first (offline), then
+    # the three Chromium 148 packages. dpkg resolves the local files with no
+    # network access. The trailing apt-get -f is a safety net that only pulls
+    # from whatever repos the base image already trusts (no Debian repos added).
+    dpkg -i /tmp/chromium148/deps/*.deb || true && \
+    dpkg -i /tmp/chromium148/chromium-common.deb \
+            /tmp/chromium148/chromium.deb \
+            /tmp/chromium148/chromium-driver.deb || \
+    apt-get install -y -f --no-install-recommends && \
+    apt-mark hold chromium chromium-common chromium-driver && \
+    rm -rf /tmp/chromium148 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    chromium --version || true
+    # Fail the build loudly if the browser did not land (previously masked by `|| true`).
+    chromium --version && chromedriver --version
 
 
 # Chromium profile setup (in /config/.config/chromium-synth — matches SyntH)

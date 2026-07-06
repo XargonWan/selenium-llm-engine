@@ -351,6 +351,44 @@ class SeleniumLLMBase:
         logger.warning("[selenium] ChromeDriver binary not found")
         return None
 
+    def _writable_chromedriver_copy(self, chromedriver_path: str) -> str:
+        """Return a chromedriver path that the current user can patch in place.
+
+        undetected_chromedriver patches the driver binary in place to strip
+        automation fingerprints. When chromedriver is installed from a system
+        package it lives in a root-owned location (e.g. /usr/bin/chromedriver)
+        that the runtime user (abc) cannot write to, so uc.Chrome fails with
+        ``[Errno 13] Permission denied``. Copy it into the writable profile
+        directory and hand uc that copy instead.
+        """
+        try:
+            if os.access(chromedriver_path, os.W_OK):
+                return chromedriver_path
+        except OSError:
+            pass
+        try:
+            dest_dir = os.path.join(self.profile_dir, "chromedriver")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, "chromedriver")
+            if not os.path.exists(dest) or os.path.getmtime(dest) < os.path.getmtime(
+                chromedriver_path
+            ):
+                shutil.copy2(chromedriver_path, dest)
+            os.chmod(dest, 0o755)
+            logger.info(
+                "[selenium] Using writable chromedriver copy: %s (from %s)",
+                dest,
+                chromedriver_path,
+            )
+            return dest
+        except Exception as e:
+            logger.warning(
+                "[selenium] Could not create writable chromedriver copy from %s: %s",
+                chromedriver_path,
+                e,
+            )
+            return chromedriver_path
+
     def _get_chromium_major_version(
         self, chromium_binary: Optional[str] = None
     ) -> Optional[int]:
@@ -487,9 +525,22 @@ class SeleniumLLMBase:
                     logger.info(
                         f"[selenium] Driver initialization attempt {attempt + 1}/{max_retries}"
                     )
+                    # uc patches the driver binary in place, which requires a
+                    # writable path. System chromedriver is root-owned, so hand
+                    # uc a writable copy under the profile dir.
+                    uc_driver_path = self._writable_chromedriver_copy(
+                        chromedriver_path
+                    )
                     uc_kwargs: dict[str, Any] = {
                         "options": options,
-                        "service": Service(executable_path=chromedriver_path),
+                        "service": Service(executable_path=uc_driver_path),
+                        # Pin the system chromedriver so undetected_chromedriver
+                        # does NOT auto-download a mismatched driver (e.g. it
+                        # fetches 150 for a 148 browser). uc.Chrome ignores the
+                        # Service executable_path but honours
+                        # driver_executable_path, which takes precedence over
+                        # its built-in auto-downloader.
+                        "driver_executable_path": uc_driver_path,
                     }
                     if chromium_major is not None:
                         uc_kwargs["version_main"] = chromium_major
