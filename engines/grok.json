@@ -48,6 +48,11 @@
       "div[data-testid='stop-button']",
       "div.h-10.aspect-square:not(.relative)",
       "div.h-10.aspect-square:has(svg[width='16'])"
+    ],
+    "accept_button": [
+      "button[data-slot='button'].bg-button-filled.rounded-full.max-w-sm",
+      "button[data-slot='button'].bg-button-filled.w-full.max-w-sm",
+      "button[data-slot='button'].bg-button-filled.rounded-full"
     ]
   },
   "media_support": {

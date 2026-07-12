@@ -26,5 +26,19 @@ def test_json_engine_loads_accept_button_selectors():
     ]
 
 
+def test_json_engine_loads_grok_tos_gate_dismiss_selectors():
+    """Grok shows a Terms-of-Service gate ("Got it") that must be dismissed
+    before the prompt area becomes reachable. Ensure the dismiss selectors are
+    loaded as accept_button selectors."""
+    engines_dir = Path(__file__).parent.parent / "engines"
+    engine = JsonEngine(engines_dir / "grok.json")
+
+    assert engine.accept_button_selectors == [
+        "button[data-slot='button'].bg-button-filled.rounded-full.max-w-sm",
+        "button[data-slot='button'].bg-button-filled.w-full.max-w-sm",
+        "button[data-slot='button'].bg-button-filled.rounded-full",
+    ]
+
+
 if __name__ == "__main__":
     main()

@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Dict, Optional, cast
+from urllib.parse import urlparse
 
 import undetected_chromedriver as uc
 from selenium import webdriver
@@ -201,6 +202,9 @@ class SeleniumLLMBase:
         # Selector cache: remember the last working selector to try it first
         self._cached_prompt_selector: Optional[str] = None
         self._cached_send_selector: Optional[str] = None
+        # Set by _post_send_check when a genuine cross-host redirect is seen so
+        # the retry loop can fail fast on deterministic auth redirects.
+        self._last_send_offsite_redirect: bool = False
 
         # Prompt chunking: split prompts that exceed the model char limit.
         # This is a safety cap — the actual number of parts is computed
@@ -433,11 +437,23 @@ class SeleniumLLMBase:
             "--disable-plugins",
             "--disable-web-security",
             "--allow-running-insecure-content",
-            "--disable-features=VizDisplayCompositor",
+            # Chrome only honours a single --disable-features flag, so all
+            # disabled features must be listed together (comma-separated).
+            # CalculateNativeWinOcclusion is added for renderer stability: with
+            # multiple heavy SPA tabs sharing a single browser process, an
+            # out-of-memory renderer crash ("Unable to receive message from
+            # renderer" / "invalid session id") can kill the whole shared
+            # session. These flags reduce per-renderer memory pressure and stop
+            # Chrome from discarding backgrounded tabs.
+            "--disable-features=VizDisplayCompositor,CalculateNativeWinOcclusion",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
             "--restore-last-session",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-back-forward-cache",
+            "--js-flags=--max-old-space-size=512",
         ]
         if self.headless:
             essential_args.append("--headless=new")
@@ -880,6 +896,16 @@ class SeleniumLLMBase:
         """Return True if *exc* signals a redirect-stall (prompt submitted but page navigated away)."""
         return "redirect-stall:" in str(exc).lower()
 
+    def _is_offsite_redirect_stall(self, exc: Exception) -> bool:
+        """Return True if *exc* signals an off-site redirect-stall.
+
+        An off-site redirect (the page navigated to a different host, typically
+        an authentication/login domain) is deterministic: retrying will not
+        resolve it because the service requires the user to sign in. Such a
+        stall must fail fast instead of consuming the whole retry budget.
+        """
+        return "redirect-stall (off-site)" in str(exc).lower()
+
     def _is_response_detection_timeout(self, exc: Exception) -> bool:
         """Return True if *exc* signals that the LLM response was not detected in time."""
         return "selenium_response_detection_timeout" in str(exc)
@@ -1239,8 +1265,18 @@ class SeleniumLLMBase:
                 except TypeError:
                     return self._sync_generate_response_once(prompt)
             except (RuntimeError, TimeoutException) as e:
+                # Off-site redirect-stall is deterministic (the service bounced
+                # to a login/auth host): retrying wastes the whole budget, so
+                # fail fast and surface the error to the caller immediately.
+                if self._is_offsite_redirect_stall(e):
+                    logger.warning(
+                        f"[selenium] Off-site redirect-stall on attempt {attempt + 1}: "
+                        "service requires authentication — failing fast without retry."
+                    )
+                    raise
+
                 is_chunking_freeze = any(msg in str(e) for msg in [
-                    "Send button did not become ready after final chunk",
+                    "Send button did not become ready",
                     "redirect-stall",
                     "not accepted by UI",
                     "Could not find prompt input area",
@@ -1374,6 +1410,11 @@ class SeleniumLLMBase:
         t1 = time.time()
         logger.info(f"[timing] page_ready: {t1 - t0:.2f}s")
 
+        # Dismiss any gate/consent dialog (e.g. a Terms-of-Service acknowledgement)
+        # that may block the prompt area before it can be located. This is a no-op
+        # for engines that do not configure accept_button selectors.
+        self._click_accept_buttons(driver, timeout=2.0)
+
         if self._is_captcha_present(driver):
             logger.warning("[selenium] Cloudflare captcha challenge detected on page")
             return (
@@ -1448,6 +1489,13 @@ class SeleniumLLMBase:
                 if not self._post_send_check(driver):
                     self._cached_prompt_selector = None
                     self._cached_send_selector = None
+                    if getattr(self, "_last_send_offsite_redirect", False):
+                        # Deterministic cross-host redirect (e.g. the service
+                        # bounced to a login/auth domain). Retrying cannot help,
+                        # so mark it off-site to trigger fail-fast in the caller.
+                        raise RuntimeError(
+                            "redirect-stall (off-site): send not accepted after redirect"
+                        )
                     raise RuntimeError(
                         "redirect-stall: send not accepted after redirect"
                     )
@@ -2337,21 +2385,49 @@ class SeleniumLLMBase:
         except Exception:
             return ""
 
+    @staticmethod
+    def _strip_all_whitespace(text: str) -> str:
+        """Collapse a string to its non-whitespace characters only.
+
+        Rich-text editors (ProseMirror, Lexical, Quill, …) frequently
+        re-flow whitespace when text is inserted programmatically: they may
+        split paragraphs, drop trailing spaces per line, or collapse runs of
+        spaces. That makes a strict whitespace-preserving comparison too
+        brittle, so this helper is used as a tolerant fallback that compares
+        only the meaningful (non-whitespace) content.
+        """
+        return "".join(text.split())
+
     def _verify_input_text(self, driver: Any, element: Any, expected: str) -> bool:
         expected_norm = self._normalize_input_text(expected)
+        expected_compact = self._strip_all_whitespace(expected)
         end_time = time.time() + 1.0
         actual = ""
         while time.time() < end_time:
             actual = self._get_input_text(driver, element)
             if self._normalize_input_text(actual) == expected_norm:
                 return True
+            # Tolerant fallback: contenteditable editors may re-flow
+            # whitespace (paragraph splits, dropped trailing spaces). Accept
+            # the fill when the meaningful, non-whitespace content matches.
+            if self._strip_all_whitespace(actual) == expected_compact:
+                logger.debug(
+                    "[selenium] fill_input matched after whitespace-insensitive "
+                    "comparison (editor re-flowed whitespace)"
+                )
+                return True
             time.sleep(0.1)
+        actual_norm = self._normalize_input_text(actual)
         logger.warning(
             "[selenium] fill_input verification failed: expected %s chars, got %s chars",
             len(expected_norm),
-            len(self._normalize_input_text(actual)),
+            len(actual_norm),
         )
-        logger.debug("[selenium] fill_input actual content=%r", actual)
+        logger.warning(
+            "[selenium] fill_input expected_tail=%r actual_tail=%r",
+            expected_norm[-160:],
+            actual_norm[-160:],
+        )
         return False
 
     def _fill_input(self, driver: Any, element: Any, text: str) -> None:
@@ -2390,35 +2466,71 @@ class SeleniumLLMBase:
                             pass
                     element.send_keys(text)
                 else:
-                    # contenteditable (ProseMirror, Quill, …)
-                    # Prefer JS execCommand: instant, no char-by-char latency.  Fall back
-                    # to send_keys if execCommand is unavailable or raises.
-                    js_ok = False
+                    # contenteditable (ProseMirror, Lexical, Quill, …)
+                    # First try JS execCommand: instant, no char-by-char latency.  Some
+                    # rich-text editors (notably ProseMirror-based ones) intercept and
+                    # ignore execCommand, leaving stale content untouched, so we always
+                    # verify the DOM afterwards and fall back to native key events, which
+                    # produce real keyboard input the editor cannot ignore.
                     try:
+                        # Clear any existing (possibly stale) content, then insert.
                         driver.execute_script(
-                            "arguments[0].focus();"
+                            "const el = arguments[0];"
+                            "el.focus();"
+                            "document.execCommand('selectAll', false, null);"
+                            "document.execCommand('delete', false, null);",
+                            element,
+                        )
+                        time.sleep(0.05)
+                        driver.execute_script(
+                            "const el = arguments[0];"
+                            "el.focus();"
                             "document.execCommand('selectAll', false, null);"
                             "document.execCommand('insertText', false, arguments[1]);",
                             element,
                             text,
                         )
-                        js_ok = True
                     except Exception:
                         pass
-                    if not js_ok:
+
+                    # Verify execCommand actually populated the editor.  If the content
+                    # does not match (editor ignored execCommand or retained stale text),
+                    # fall back to native key events: select-all + delete + type.
+                    exec_ok = False
+                    try:
+                        current = self._get_input_text(driver, element)
+                        exec_ok = self._strip_all_whitespace(
+                            current
+                        ) == self._strip_all_whitespace(text)
+                    except Exception:
+                        exec_ok = False
+
+                    if not exec_ok:
+                        try:
+                            element.click()
+                        except Exception:
+                            try:
+                                driver.execute_script(
+                                    "arguments[0].focus();", element
+                                )
+                            except Exception:
+                                pass
                         try:
                             element.send_keys(Keys.CONTROL + "a")
+                            element.send_keys(Keys.DELETE)
                             time.sleep(0.05)
                             element.send_keys(text)
                         except Exception as e:
                             if isinstance(e, StaleElementReferenceException):
                                 raise
-                            logger.error(f"[selenium] fill_input send_keys failed: {e}")
+                            logger.error(
+                                f"[selenium] fill_input send_keys failed: {e}"
+                            )
                             raise
                     else:
-                        # Some frameworks distinguish programmatic updates from user key events.
-                        # Trigger a whitespace keypress + backspace to force UI internals to re-evaluate
-                        # and enable the send button as if input was typed by the user.
+                        # Some frameworks distinguish programmatic updates from user key
+                        # events.  Trigger a whitespace keypress + backspace to force UI
+                        # internals to re-evaluate and enable the send button.
                         try:
                             element.send_keys(Keys.SPACE, Keys.BACKSPACE)
                         except Exception:
@@ -2729,6 +2841,27 @@ class SeleniumLLMBase:
         logger.warning(f"[selenium] Send button did not become ready within {timeout:.1f}s")
         return False
 
+    def _is_same_site(self, current_url: str) -> bool:
+        """Return True if *current_url* is on the same host as service_url.
+
+        Some engines create a new conversation on send and navigate to a
+        different path on the same host (e.g. from ``/c`` to ``/chat/<id>``).
+        That in-site navigation is normal and must NOT be treated as a
+        redirect-stall. A genuine stall sends the browser to a different host
+        (e.g. an auth/login domain). Comparing only the host — instead of a
+        full URL prefix — makes the check robust to per-conversation paths.
+        """
+        if not self.service_url or not current_url:
+            return True
+        try:
+            base_host = urlparse(self.service_url).netloc
+            cur_host = urlparse(current_url).netloc
+        except Exception:
+            return True
+        if not base_host or not cur_host:
+            return True
+        return base_host == cur_host
+
     def _post_send_check(self, driver: Any, timeout: float = 15.0) -> bool:
         """Return True if the LLM accepted the prompt (stop button or new text appeared).
 
@@ -2737,10 +2870,14 @@ class SeleniumLLMBase:
         - new response text different from the current baseline appears.
 
         If neither signal is seen by the deadline, inspects the current URL:
-        - URL no longer on service_url → a redirect occurred → return False (stall detected).
-        - URL still on service_url → model is just slow → return True (let _wait_for_response decide).
+        - URL navigated to a different host → a redirect occurred → return False (stall detected).
+        - URL still on the same host → model is just slow (or opened a new
+          conversation path) → return True (let _wait_for_response decide).
         """
         baseline = self._get_latest_response_text(driver)
+        # Reset the off-site flag: it is set only when a genuine cross-host
+        # redirect is observed, so the caller can fail fast instead of retrying.
+        self._last_send_offsite_redirect = False
         timeout = float(os.getenv("SELENIUM_POST_SEND_TIMEOUT", str(timeout)))
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -2770,8 +2907,11 @@ class SeleniumLLMBase:
                 _fb_url = driver.current_url or ""
             except Exception:
                 pass
-            if self.service_url and _fb_url and not _fb_url.startswith(self.service_url):
-                logger.warning("[selenium] post_send_check: redirect detected — returning False")
+            if self.service_url and _fb_url and not self._is_same_site(_fb_url):
+                logger.warning(
+                    f"[selenium] post_send_check: off-site redirect detected ('{_fb_url}') — returning False"
+                )
+                self._last_send_offsite_redirect = True
                 return False
             if not self._send_button_present(driver):
                 if self._response_area_present(driver):
@@ -2791,10 +2931,11 @@ class SeleniumLLMBase:
         except Exception:
             pass
 
-        if self.service_url and not cur_url.startswith(self.service_url):
+        if self.service_url and cur_url and not self._is_same_site(cur_url):
             logger.warning(
-                f"[selenium] post_send_check: timeout with unexpected URL '{cur_url}' — redirect-stall detected"
+                f"[selenium] post_send_check: timeout with off-site URL '{cur_url}' — redirect-stall detected"
             )
+            self._last_send_offsite_redirect = True
             return False
 
         logger.debug("[selenium] post_send_check: timeout but URL looks ok — assuming slow model")
@@ -2846,7 +2987,8 @@ class SeleniumLLMBase:
         _engine_max_wait = getattr(self, "_response_max_wait", None)
         effective_max_wait = int(_engine_max_wait) if _engine_max_wait else max_wait
         max_wait = int(os.getenv("SELENIUM_RESPONSE_MAX_WAIT", str(effective_max_wait)))
-        deadline = time.time() + max_wait
+        wait_start = time.time()
+        deadline = wait_start + max_wait
 
         previous_text_length = -1
         previous_child_count = -1
@@ -2857,7 +2999,16 @@ class SeleniumLLMBase:
         current_text_length = 0
         current_child_count = 0
 
-        while time.time() < deadline:
+        # Wall-clock guard: a single slow WebDriver call (e.g. execute_script on
+        # a page stuck in a loading state) can only be interrupted at the driver
+        # command timeout, so the loop condition below may be checked well after
+        # `deadline` has passed. This absolute cap ensures the watcher can never
+        # run away far beyond its budget and leave an orphaned worker thread
+        # spinning (which previously produced multi-minute "wait_for_response"
+        # times). It grants a small grace window on top of max_wait.
+        hard_cap = max_wait + max(30, int(max_wait * 0.5))
+
+        while time.time() < deadline and (time.time() - wait_start) < hard_cap:
             iteration += 1
             container, selector = self._find_response_container_element(driver)
             if container is None:
@@ -2936,9 +3087,27 @@ class SeleniumLLMBase:
                 and stable_counter >= 2 
                 and (current_text_length > 0 or current_child_count > 0)
             )
+            # No-progress freeze: some engines never expose a detectable stop
+            # button (or hide it while "thinking"), so the two checks above can
+            # stay False forever and the watcher would spin until the deadline.
+            # If generation never started AND no response text/children have
+            # appeared for well beyond the silent-freeze threshold, treat it as
+            # a stall so the caller can recover instead of blocking the worker.
+            no_progress_grace = max(silent_freeze_threshold * 2, 30.0)
+            is_no_progress_freeze = (
+                not self._generation_was_active
+                and current_text_length == 0
+                and current_child_count == 0
+                and (time.time() - wait_start) > no_progress_grace
+            )
 
-            if is_silent_freeze or is_ui_stuck:
-                freeze_reason = "silent freeze" if is_silent_freeze else "UI stuck after completion"
+            if is_silent_freeze or is_ui_stuck or is_no_progress_freeze:
+                if is_silent_freeze:
+                    freeze_reason = "silent freeze"
+                elif is_ui_stuck:
+                    freeze_reason = "UI stuck after completion"
+                else:
+                    freeze_reason = "no-progress freeze (no response detected)"
                 logger.warning(
                     "[selenium] %s detected: Stop button visible but no proper UI transition (inactive %.1fs, text_len=%d, stable=%d)",
                     freeze_reason,

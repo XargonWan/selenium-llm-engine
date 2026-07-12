@@ -417,6 +417,54 @@ def test_media_limits_fallback_without_config():
     assert engine._check_media_limits(media_items, "base") is None
 
 
+def test_is_same_site_treats_in_site_navigation_as_not_a_redirect():
+    """Some engines open a new conversation on send and navigate to a different
+    path on the SAME host (e.g. '/c' -> '/chat/<id>'). That must not be flagged
+    as a redirect-stall. Only a navigation to a DIFFERENT host is a real stall.
+    """
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com/c",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    # Same host, different path -> in-site navigation, not a stall.
+    assert engine._is_same_site("https://example.com/chat/abc-123") is True
+    assert engine._is_same_site("https://example.com/") is True
+    # Different host -> genuine off-site redirect (e.g. auth/login).
+    assert engine._is_same_site("https://auth.example.org/login") is False
+    # Empty/unknown URL is treated conservatively as same-site (no false stall).
+    assert engine._is_same_site("") is True
+
+
+def test_offsite_redirect_stall_is_distinguished_from_generic_stall():
+    """A deterministic cross-host redirect (e.g. the service bounced to a
+    login/auth domain) must be classified as an off-site stall so the retry
+    loop can fail fast, while a generic redirect-stall must NOT be treated as
+    off-site (it may be transient and worth retrying).
+    """
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com/c",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    offsite = RuntimeError("redirect-stall (off-site): send not accepted after redirect")
+    generic = RuntimeError("redirect-stall: send not accepted after redirect")
+
+    # Off-site stall is recognised as off-site (fail fast).
+    assert engine._is_offsite_redirect_stall(offsite) is True
+    # Generic stall is NOT off-site (may retry).
+    assert engine._is_offsite_redirect_stall(generic) is False
+    # A generic stall is still a redirect-stall...
+    assert engine._is_redirect_stall(generic) is True
+    # ...whereas the off-site variant is not matched by the generic detector,
+    # ensuring it takes the fail-fast branch instead of the retry branch.
+    assert engine._is_redirect_stall(offsite) is False
+
+
 def test_stepfun_audio_not_supported_by_model():
     from core.selenium_llm_base import SeleniumLLMBase
 

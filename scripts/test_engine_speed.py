@@ -15,9 +15,9 @@ def test_speed(engine="gemini", prompt="Hello, how are you?"):
         end_time = time.time()
         
         if response.status_code == 200:
-            data = response.json()
             elapsed = end_time - start_time
             print(f"SUCCESS: Received response in {elapsed:.2f} seconds")
+            # data = response.json()
             # print(f"Response: {data['choices'][0]['message']['content'][:100]}...")
         else:
             print(f"FAILURE: Status code {response.status_code}")

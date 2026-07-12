@@ -12,18 +12,22 @@
   },
   "selectors": {
     "prompt_area": [
-      "div#ask-input",
+      "div#ask-input[contenteditable='true']",
       "div[contenteditable='true'][id='ask-input']",
+      "div.Publisher_input__fjtjQ div[contenteditable='true']",
       "div[contenteditable='true']",
-      "textarea"
+      "textarea[placeholder*='want to know']:not([disabled])",
+      "textarea.Publisher_textarea__pMX9t:not([disabled])",
+      "textarea:not([disabled])"
     ],
     "send_button": [
       "button[aria-label='Submit'][data-state='closed'][type='button']",
-      "#root > div.border-subtlest.ring-subtlest.divide-subtlest.bg-base > div > div > main > div > div.mx-auto.flex.w-full.flex-col.h-full > div > div > div > div > div.static.w-full.grow.flex-col.items-center.pb-\\[10vh\\].md\\:mt-0.md\\:flex.z-10.border-subtlest.ring-subtlest.divide-subtlest > div:nth-child(3) > div.relative > div > div > div > span > div > div.bg-raised.dark\\:bg-subtlest.w-full.outline-none.flex.items-center.border.rounded-2xl.duration-75.transition-all.border-subtle.shadow-sm.dark\\:shadow-md.shadow-black\\/5.px-0.pt-3.pb-3.gap-y-md.grid.items-center > div > div.flex.items-center.justify-self-end.gap-sm.col-start-2.row-start-2 > button",
+      "div.Publisher_input__fjtjQ button[aria-label*='Submit']",
+      "div.Publisher_input__fjtjQ button[type='submit']",
       "button[aria-label='Send']",
       "button[aria-label*='Send']",
-      "button[type='submit']",
-      "button"
+      "button[aria-label*='Submit']",
+      "button[type='submit']"
     ],
     "response_area": [
       "#markdown-content-0 > div > div > div",

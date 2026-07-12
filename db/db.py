@@ -1,9 +1,12 @@
+import logging
 import os
 import sqlite3
 import threading
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 DB_FILE = Path(os.getenv("SELENIUM_LLM_DB", "./data/selenium_engine.db"))
 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +56,8 @@ def init_database() -> None:
 def log_prompt(
     engine: str, model: str, prompt: str, response: str, status: str, elapsed_ms: int
 ) -> None:
+    # Persisting a prompt log is best-effort: a full or read-only DB must never
+    # crash the request that produced a valid response.
     with DB_LOCK:
         conn = _get_connection()
         try:
@@ -62,6 +67,8 @@ def log_prompt(
                 (engine, model, prompt, response, status, elapsed_ms),
             )
             conn.commit()
+        except sqlite3.OperationalError as e:
+            logger.warning("log_prompt skipped, DB write failed: %s", e)
         finally:
             conn.close()
 
@@ -105,6 +112,10 @@ def get_prompt_logs(
 
 
 def _inc_stat(key: str, amount: int = 1) -> None:
+    # Counters are best-effort telemetry: a full or read-only DB must never
+    # crash the request being served (previously this raised sqlite3
+    # OperationalError "database or disk is full" and turned every prompt into
+    # an HTTP 500).
     with DB_LOCK:
         conn = _get_connection()
         try:
@@ -116,6 +127,8 @@ def _inc_stat(key: str, amount: int = 1) -> None:
                 "UPDATE stats SET value = value + ? WHERE key = ?", (amount, key)
             )
             conn.commit()
+        except sqlite3.OperationalError as e:
+            logger.warning("stat '%s' increment skipped, DB write failed: %s", key, e)
         finally:
             conn.close()
 
