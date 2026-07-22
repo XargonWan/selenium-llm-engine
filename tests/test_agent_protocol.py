@@ -10,6 +10,7 @@ from core.agent_protocol import (
     ParsedAgentResponse,
     ToolCall,
     build_agent_system_prompt,
+    build_agent_turn_reminder,
     build_reformulation_prompt,
     detect_agent_context,
     needs_reformulation,
@@ -100,6 +101,21 @@ def test_build_agent_system_prompt_uses_roleplay_framing():
     assert "roleplay" in prompt
     assert "character" in prompt
     assert "never refuses" in prompt or "never refuse" in prompt
+
+
+def test_build_agent_turn_reminder_with_tools():
+    """The trailing reminder must reinforce the roleplay and demand JSON so the
+    contract stays in context at the END of long multi-turn prompts."""
+    reminder = build_agent_turn_reminder(has_tools=True).lower()
+    assert "character" in reminder
+    assert "json" in reminder
+    assert "tool_calls" in reminder
+
+
+def test_build_agent_turn_reminder_without_tools():
+    reminder = build_agent_turn_reminder(has_tools=False).lower()
+    assert "json" in reminder
+    assert "content" in reminder
 
 
 def test_build_agent_system_prompt_without_tools():

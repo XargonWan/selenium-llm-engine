@@ -37,6 +37,7 @@ from db.db import (
 )
 from core.agent_protocol import (
     build_agent_system_prompt,
+    build_agent_turn_reminder,
     build_reformulation_prompt,
     detect_agent_context,
     needs_reformulation,
@@ -810,7 +811,16 @@ async def _prompt(
     # bounded reformulation retry.
     agent_mode = agent_ctx is not None
     if agent_mode:
-        prompt_text = build_agent_system_prompt(agent_ctx) + prompt_text
+        # Prepend the full harness AND append a short in-character reminder so
+        # the roleplay contract is both the first and the LAST thing the model
+        # reads — on long multi-turn histories the leading harness alone drifts
+        # out of context and the model reverts to a plain "safe assistant".
+        has_tools = bool(agent_ctx.get("tools"))
+        prompt_text = (
+            build_agent_system_prompt(agent_ctx)
+            + prompt_text
+            + build_agent_turn_reminder(has_tools)
+        )
 
     current_task = asyncio.current_task()
     if current_task is not None:

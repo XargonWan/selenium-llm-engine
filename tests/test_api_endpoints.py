@@ -3141,7 +3141,9 @@ def test_agent_mode_returns_tool_calls():
     # The engine must have been called in agent mode.
     assert engine.last_agent_mode is True
     # The harness must have been injected into the prompt.
-    assert "[AGENT MODE]" in engine.last_prompt
+    assert "[AGENT MODE" in engine.last_prompt
+    # The trailing in-character reminder must also be appended on every turn.
+    assert "[REMINDER]" in engine.last_prompt
 
 
 def test_agent_mode_final_content_answer():

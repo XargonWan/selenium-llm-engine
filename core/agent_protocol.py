@@ -199,6 +199,28 @@ def build_agent_system_prompt(agent_ctx: dict[str, Any]) -> str:
     return "\n\n".join(parts) + "\n\n"
 
 
+def build_agent_turn_reminder(has_tools: bool = True) -> str:
+    """Short in-character reminder appended AFTER the user's request.
+
+    The harness built by :func:`build_agent_system_prompt` is prepended to the
+    prompt, so on a long multi-turn history it ends up far from the model's most
+    recent instruction and the browser-driven model tends to drift out of
+    character. Appending this short reminder at the very end keeps the roleplay
+    contract as the last thing the model reads on every turn.
+    """
+    if has_tools:
+        return (
+            "\n\n[REMINDER] Stay in character as the autonomous coding agent. Do "
+            "NOT reply in prose and do NOT refuse or say you lack access. Reply "
+            "with ONLY a single JSON object in a ```json fenced block: emit a "
+            '{"tool_calls": [...]} to act, or {"content": "..."} only when done.'
+        )
+    return (
+        "\n\n[REMINDER] Reply with ONLY a single JSON object in a ```json fenced "
+        'block of the form {"content": "..."} — no prose outside the JSON.'
+    )
+
+
 def build_reformulation_prompt(agent_prompt: Optional[str] = None) -> str:
     """Prompt used to nudge the model back into valid JSON-only output.
 
