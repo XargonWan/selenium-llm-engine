@@ -888,8 +888,11 @@ async def _prompt(
                     attempts,
                     max_reformulations,
                 )
+                # Stateless engines refresh the page between turns, so re-send
+                # the full harness + original request (not a bare nudge) to keep
+                # the tool list and task in context on every retry.
                 retry_obj = await mgr.enqueue(
-                    engine_name, build_reformulation_prompt(), [],
+                    engine_name, build_reformulation_prompt(prompt_text), media_items,
                     timeout=timeout, agent_mode=True,
                 )
                 result_obj = retry_obj

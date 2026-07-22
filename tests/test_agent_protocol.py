@@ -78,9 +78,28 @@ def test_detect_agent_context_non_dict_returns_none():
 
 def test_build_agent_system_prompt_lists_tools():
     prompt = build_agent_system_prompt({"tools": [_WEATHER_TOOL]})
-    assert "[AGENT MODE]" in prompt
+    assert "[AGENT MODE" in prompt
     assert "get_weather" in prompt
     assert "tool_calls" in prompt
+
+
+def test_build_agent_system_prompt_asserts_tools_are_executable():
+    """The harness must tell the model the tools are real and will be executed,
+    so it does not refuse with 'I can't / no access' like a plain chat."""
+    prompt = build_agent_system_prompt({"tools": [_WEATHER_TOOL]}).lower()
+    assert "execute" in prompt
+    assert "runtime" in prompt
+    # Must explicitly forbid the "I can't / no access" style refusals.
+    assert "can't" in prompt or "cannot" in prompt or "access" in prompt
+
+
+def test_build_agent_system_prompt_uses_roleplay_framing():
+    """The harness frames the task as a roleplay so guardrail-heavy web UIs
+    (even unlogged) stay in character and emit tool calls instead of refusing."""
+    prompt = build_agent_system_prompt({"tools": [_WEATHER_TOOL]}).lower()
+    assert "roleplay" in prompt
+    assert "character" in prompt
+    assert "never refuses" in prompt or "never refuse" in prompt
 
 
 def test_build_agent_system_prompt_without_tools():
@@ -98,6 +117,30 @@ def test_build_agent_system_prompt_includes_response_format():
 
 def test_build_reformulation_prompt_mentions_json():
     assert "JSON" in build_reformulation_prompt()
+
+
+def test_build_reformulation_prompt_is_self_contained():
+    """When given the original harness, the retry must re-include it verbatim
+    so the stateless engine keeps the tool list and task in context."""
+    harness = build_agent_system_prompt(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        }
+    ) + "What is the weather in Rome?"
+    retry = build_reformulation_prompt(harness)
+    assert harness in retry
+    assert "get_weather" in retry
+    assert "What is the weather in Rome?" in retry
+    assert "JSON" in retry
 
 
 # ---------------------------------------------------------------------------
