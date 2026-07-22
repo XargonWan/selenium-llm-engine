@@ -16,6 +16,7 @@ if "undetected_chromedriver" not in sys.modules:
         Chrome=lambda *args, **kwargs: None
     )
 
+import app as app_module
 from app import app, _register_engine_routes
 from core.engine_manager import EngineManager
 
@@ -26,6 +27,12 @@ class DummyEngine:
     def __init__(self):
         self.model = "default"
         self.last_media: list[Any] = []
+        self.last_agent_mode: bool = False
+        self.last_prompt: str = ""
+        # When set, generate_response returns this instead of the default text.
+        # May be a string or a list of strings (consumed one per call, useful
+        # for simulating reformulation retries).
+        self.next_response: Any = None
 
     def get_interface_limits(self):
         return {"max_prompt_chars": 1234, "model_name": "default"}
@@ -39,8 +46,14 @@ class DummyEngine:
     async def check_login_state(self):
         return {"logged_in": False, "login_state": "unlogged"}
 
-    async def generate_response(self, prompt, media=None, timeout=None):
+    async def generate_response(self, prompt, media=None, timeout=None, agent_mode=False):
         self.last_media = media or []
+        self.last_agent_mode = agent_mode
+        self.last_prompt = prompt
+        if isinstance(self.next_response, list) and self.next_response:
+            return self.next_response.pop(0)
+        if self.next_response is not None:
+            return self.next_response
         return "dummy response"
 
     def get_current_model(self):
@@ -56,6 +69,10 @@ def setup_engine_manager(monkeypatch):
     monkeypatch.setattr("app.inc_errors", lambda: None)
     monkeypatch.setattr("app.log_prompt", lambda *a, **kw: None)
     monkeypatch.setattr("app.inc_media_sent", lambda *a, **kw: None)
+
+    # Reset the per-client rate-limit window so tests don't exhaust the shared
+    # 20-req/60s budget across the (large) suite and get spurious 429s.
+    app_module.rate_limit_store.clear()
 
     mgr = EngineManager.get()
     mgr.engines.clear()
@@ -3077,4 +3094,164 @@ def test_sync_generate_response_dynamic_chunking_retry():
     assert result == "dynamic result"
     assert engine._split_prompt_parts == 3
     assert engine._reset_driver.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Agentic (tool-calling) lane — /v1/chat/completions with tools
+# ---------------------------------------------------------------------------
+
+
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+def test_agent_mode_returns_tool_calls():
+    """A request with `tools` must yield an OpenAI tool_calls response."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = (
+        '```json\n{"tool_calls": [{"name": "get_weather", '
+        '"arguments": {"city": "Rome"}}]}\n```'
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Weather in Rome?"}],
+            "tools": [_WEATHER_TOOL],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    choice = data["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_calls = choice["message"]["tool_calls"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "Rome"}
+    # The engine must have been called in agent mode.
+    assert engine.last_agent_mode is True
+    # The harness must have been injected into the prompt.
+    assert "[AGENT MODE]" in engine.last_prompt
+
+
+def test_agent_mode_final_content_answer():
+    """A JSON {content:...} reply must map to a normal stop response."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = '```json\n{"content": "It is sunny."}\n```'
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [_WEATHER_TOOL],
+        },
+    )
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "It is sunny."
+
+
+def test_agent_mode_reformulation_retry():
+    """An unparseable first reply must trigger a bounded reformulation retry."""
+    engine = EngineManager.get().engines["chatgpt"]
+    # First reply is prose (unparseable), second is valid JSON.
+    engine.next_response = [
+        "Sure, I would call get_weather for Rome.",
+        '```json\n{"tool_calls": [{"name": "get_weather", '
+        '"arguments": {"city": "Rome"}}]}\n```',
+    ]
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Weather in Rome?"}],
+            "tools": [_WEATHER_TOOL],
+        },
+    )
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    # Both the initial reply and the reformulation prompt were consumed.
+    assert engine.next_response == []
+
+
+def test_agent_mode_reformulation_gives_up_gracefully():
+    """After max retries with unparseable output, degrade to raw content."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = "I cannot produce JSON, sorry."
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [_WEATHER_TOOL],
+        },
+    )
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    # No empty response: raw text is returned as content.
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "I cannot produce JSON, sorry."
+
+
+def test_non_agent_request_unchanged():
+    """A plain chat request (no tools) must NOT enter agent mode."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = "dummy response"
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "dummy response"
+    assert engine.last_agent_mode is False
+    assert "[AGENT MODE]" not in engine.last_prompt
+
+
+def test_agent_mode_empty_tools_list_is_not_agentic():
+    """An empty tools list must not trigger agent mode (no harness injected)."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = "dummy response"
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [],
+        },
+    )
+    assert response.status_code == 200
+    assert engine.last_agent_mode is False
+
+
+def test_agent_mode_response_format_triggers_agent():
+    """A response_format json_object must trigger agent mode without tools."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = '```json\n{"content": "{\\"ok\\": true}"}\n```'
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Give me JSON"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert response.status_code == 200
+    assert engine.last_agent_mode is True
 

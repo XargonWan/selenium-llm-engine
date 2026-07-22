@@ -12,9 +12,21 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[list[ToolCall]] = None
 
 
 class ChatChoice(BaseModel):

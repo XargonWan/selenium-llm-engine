@@ -35,6 +35,14 @@ from db.db import (
     inc_requests,
     inc_responses,
 )
+from core.agent_protocol import (
+    build_agent_system_prompt,
+    build_reformulation_prompt,
+    detect_agent_context,
+    needs_reformulation,
+    parse_agent_response,
+    to_openai_tool_calls,
+)
 from core.engine_manager import EngineManager
 from core.models import (
     ChatCompletion,
@@ -377,10 +385,32 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _openai_response(
-    engine_name: str, model_name: str, prompt: str, response_text: str, elapsed_ms: int
+    engine_name: str,
+    model_name: str,
+    prompt: str,
+    response_text: str,
+    elapsed_ms: int,
+    agent_parsed: Any = None,
 ) -> Dict[str, Any]:
     prompt_tokens = _estimate_tokens(prompt)
     completion_tokens = _estimate_tokens(response_text)
+
+    # Agent mode: emit OpenAI tool_calls when the model requested tool use.
+    if agent_parsed is not None and getattr(agent_parsed, "tool_calls", None):
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": to_openai_tool_calls(agent_parsed.tool_calls),
+        }
+        finish_reason = "tool_calls"
+    else:
+        # Prefer parsed final content when available, else the raw scraped text.
+        content = response_text
+        if agent_parsed is not None and getattr(agent_parsed, "content", None):
+            content = agent_parsed.content
+        message = {"role": "assistant", "content": content}
+        finish_reason = "stop"
+
     return {
         "id": f"llm_{int(time.time())}",
         "object": "chat.completion",
@@ -389,8 +419,8 @@ def _openai_response(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": response_text},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -720,9 +750,18 @@ async def openai_chat(req: Request) -> Any:
 
     stream = bool(data.get("stream", False))
 
+    # Detect the agentic (tool-calling) lane from OpenAI agentic fields.
+    agent_ctx = detect_agent_context(data)
+    if agent_ctx is not None:
+        logger.info(
+            "[agent] Agentic request detected (tools=%d, response_format=%s)",
+            len(agent_ctx.get("tools") or []),
+            bool(agent_ctx.get("response_format")),
+        )
+
     return await _prompt(
         engine, req, explicit_prompt=prompt_payload, model_name=model, stream=stream,
-        timeout=data.get("timeout"),
+        timeout=data.get("timeout"), agent_ctx=agent_ctx,
     )
 
 
@@ -739,6 +778,7 @@ async def _prompt(
     model_name: str = "default",
     stream: bool = False,
     timeout: int | None = None,
+    agent_ctx: Dict[str, Any] | None = None,
 ) -> Any:
     if RESET_IN_PROGRESS:
         raise HTTPException(
@@ -765,6 +805,13 @@ async def _prompt(
     if not isinstance(prompt_text, str):
         prompt_text = str(prompt_text)
 
+    # Agent mode: prepend the tool-calling harness so the browser-driven model
+    # replies with parseable JSON. The scraped reply is parsed below with a
+    # bounded reformulation retry.
+    agent_mode = agent_ctx is not None
+    if agent_mode:
+        prompt_text = build_agent_system_prompt(agent_ctx) + prompt_text
+
     current_task = asyncio.current_task()
     if current_task is not None:
         _register_task(current_task)
@@ -782,7 +829,7 @@ async def _prompt(
                     # SSE heartbeats while waiting, keeping the connection alive.
                     result_future = asyncio.ensure_future(
                         mgr.enqueue(engine_name, prompt_text, media_items,
-                                    timeout=timeout)
+                                    timeout=timeout, agent_mode=agent_mode)
                     )
 
                     heartbeat_interval = 5.0  # seconds
@@ -826,7 +873,28 @@ async def _prompt(
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
         result_obj = await mgr.enqueue(engine_name, prompt_text, media_items,
-                                        timeout=timeout)
+                                        timeout=timeout, agent_mode=agent_mode)
+
+        agent_parsed = None
+        if agent_mode:
+            agent_parsed = parse_agent_response(result_obj.text)
+            # Bounded reformulation retries when the reply is not parseable.
+            max_reformulations = 2
+            attempts = 0
+            while needs_reformulation(agent_parsed) and attempts < max_reformulations:
+                attempts += 1
+                logger.warning(
+                    "[agent] Unparseable reply, reformulation attempt %d/%d",
+                    attempts,
+                    max_reformulations,
+                )
+                retry_obj = await mgr.enqueue(
+                    engine_name, build_reformulation_prompt(), [],
+                    timeout=timeout, agent_mode=True,
+                )
+                result_obj = retry_obj
+                agent_parsed = parse_agent_response(result_obj.text)
+
         duration_ms = int((time.time() - start) * 1000)
         if media_items:
             inc_media_sent(len(media_items))
@@ -846,6 +914,7 @@ async def _prompt(
             prompt_text,
             result_obj.text,
             duration_ms,
+            agent_parsed=agent_parsed,
         )
 
     except asyncio.CancelledError:

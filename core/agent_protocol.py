@@ -1,0 +1,333 @@
+"""Agent protocol helpers — engine-agnostic tool-calling harness.
+
+This module turns an OpenAI-style *agentic* request (one that carries a
+``tools`` / ``tool_choice`` / ``response_format`` field) into a plain-text
+prompt harness that a browser-automated chat UI can answer, and parses the
+model's free-text reply back into structured tool calls.
+
+Why this exists
+---------------
+The engines driven by this project scrape a consumer chat web UI; they do not
+expose native function-calling. To make the agentic lane work we:
+
+1. Inject a *system harness* that instructs the model to answer **only** with a
+   JSON object (wrapped in a ```json fenced block) describing either the tool
+   calls to perform or the final textual answer.
+2. Parse that reply robustly (fenced block first, then a balanced ``{...}``
+   scan, then a tolerant ``json.loads``).
+3. If parsing fails, ask the caller to re-issue a *reformulation* prompt that
+   nudges the model to emit valid JSON only.
+
+Engine-agnosticism
+-------------------
+This module MUST NOT reference any specific engine or LLM service. It only
+knows about the generic OpenAI ``tools`` schema.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+logger = logging.getLogger("agent_protocol")
+
+# Marker used in the harness so the parser can locate the JSON payload even
+# when the model wraps it in prose or markdown.
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """A single parsed tool call."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ParsedAgentResponse:
+    """Structured result of parsing a model reply in agent mode."""
+
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    content: Optional[str] = None
+    parsed_ok: bool = False
+    raw_text: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Agent-mode detection
+# ---------------------------------------------------------------------------
+
+
+def detect_agent_context(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Return an agent context dict when *data* looks like an agentic request.
+
+    A request is considered agentic when it carries any of the OpenAI agentic
+    fields (``tools``, ``tool_choice``, ``response_format``) or an explicit
+    override (``mode == "agent"``). Returns ``None`` for a plain chat request.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    tools = data.get("tools")
+    tool_choice = data.get("tool_choice")
+    response_format = data.get("response_format")
+    explicit = str(data.get("mode", "")).strip().lower() == "agent"
+
+    has_tools = isinstance(tools, list) and len(tools) > 0
+    has_response_format = isinstance(response_format, dict) and bool(response_format)
+
+    if not (has_tools or tool_choice or has_response_format or explicit):
+        return None
+
+    return {
+        "tools": tools if has_tools else [],
+        "tool_choice": tool_choice,
+        "response_format": response_format if has_response_format else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prompt harness
+# ---------------------------------------------------------------------------
+
+
+def _describe_tool(tool: dict[str, Any]) -> Optional[str]:
+    """Render a single OpenAI tool definition as a compact description line."""
+    if not isinstance(tool, dict):
+        return None
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    name = fn.get("name")
+    if not name:
+        return None
+    description = fn.get("description", "") or ""
+    parameters = fn.get("parameters", {})
+    try:
+        params_json = json.dumps(parameters, ensure_ascii=False)
+    except Exception:
+        params_json = "{}"
+    return f"- {name}: {description}\n  parameters (JSON schema): {params_json}"
+
+
+def build_agent_system_prompt(agent_ctx: dict[str, Any]) -> str:
+    """Build the system harness that forces JSON-only tool-call output.
+
+    The harness is prepended to the user prompt so the (browser-driven) model
+    answers with a single JSON object we can parse deterministically.
+    """
+    tools = agent_ctx.get("tools") or []
+    response_format = agent_ctx.get("response_format")
+
+    tool_lines: list[str] = []
+    for tool in tools:
+        line = _describe_tool(tool)
+        if line:
+            tool_lines.append(line)
+
+    parts: list[str] = []
+    parts.append(
+        "[AGENT MODE]\n"
+        "You are operating as a tool-using agent. You MUST reply with a single "
+        "JSON object and NOTHING else — no prose, no explanation, no markdown "
+        "outside the JSON. Wrap the JSON in a fenced block exactly like:\n"
+        "```json\n{ ... }\n```\n"
+    )
+
+    if tool_lines:
+        parts.append("Available tools:\n" + "\n".join(tool_lines))
+        parts.append(
+            "To call one or more tools, reply with:\n"
+            "```json\n"
+            '{"tool_calls": [{"name": "<tool_name>", '
+            '"arguments": {<json arguments>}}]}\n'
+            "```\n"
+            "When the task is complete and no tool is needed, reply with:\n"
+            "```json\n"
+            '{"content": "<your final answer as plain text>"}\n'
+            "```"
+        )
+    else:
+        parts.append(
+            "Reply with a single JSON object of the form:\n"
+            "```json\n"
+            '{"content": "<your answer as plain text>"}\n'
+            "```"
+        )
+
+    if response_format:
+        try:
+            rf_json = json.dumps(response_format, ensure_ascii=False)
+        except Exception:
+            rf_json = "{}"
+        parts.append(
+            "The final answer JSON must conform to this response_format: " + rf_json
+        )
+
+    return "\n\n".join(parts) + "\n\n"
+
+
+def build_reformulation_prompt() -> str:
+    """Prompt used to nudge the model back into valid JSON-only output."""
+    return (
+        "Your previous reply could not be parsed. Reply again with ONLY a single "
+        "valid JSON object wrapped in a ```json fenced block, following the agent "
+        "format described earlier. Do not include any text outside the JSON."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+
+def _extract_json_blob(text: str) -> Optional[str]:
+    """Extract the most likely JSON payload from *text*.
+
+    Tries a fenced ```json block first, then falls back to the first balanced
+    ``{...}`` object found in the text.
+    """
+    if not text:
+        return None
+
+    # 1. Fenced block(s): prefer the last fenced block (final answer).
+    fenced = _FENCE_RE.findall(text)
+    for candidate in reversed(fenced):
+        candidate = candidate.strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            return candidate
+
+    # 2. Balanced-brace scan for the first {...} object.
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        start = text.find("{", start + 1)
+
+    return None
+
+
+def _tolerant_loads(blob: str) -> Optional[Any]:
+    """Attempt ``json.loads`` with a couple of best-effort cleanups."""
+    for attempt in (blob, _strip_trailing_commas(blob)):
+        try:
+            return json.loads(attempt)
+        except Exception:
+            continue
+    return None
+
+
+def _strip_trailing_commas(blob: str) -> str:
+    """Remove trailing commas before closing braces/brackets."""
+    return re.sub(r",\s*([}\]])", r"\1", blob)
+
+
+def _normalize_tool_calls(obj: Any) -> list[ToolCall]:
+    """Extract tool calls from a parsed object under common key names."""
+    calls_raw: Any = None
+    if isinstance(obj, dict):
+        for key in ("tool_calls", "actions", "calls"):
+            if isinstance(obj.get(key), list):
+                calls_raw = obj[key]
+                break
+    if not isinstance(calls_raw, list):
+        return []
+
+    result: list[ToolCall] = []
+    for idx, item in enumerate(calls_raw):
+        if not isinstance(item, dict):
+            continue
+        # Support both flat {name, arguments} and OpenAI {function: {...}} shapes.
+        fn = item.get("function") if isinstance(item.get("function"), dict) else item
+        name = fn.get("name") or item.get("name")
+        if not name:
+            continue
+        arguments = fn.get("arguments", item.get("arguments", {}))
+        if isinstance(arguments, str):
+            arguments = _tolerant_loads(arguments) or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        call_id = str(item.get("id") or f"call_{idx}")
+        result.append(ToolCall(id=call_id, name=str(name), arguments=arguments))
+    return result
+
+
+def parse_agent_response(text: str) -> ParsedAgentResponse:
+    """Parse a raw model reply into structured tool calls or final content."""
+    result = ParsedAgentResponse(raw_text=text or "")
+    blob = _extract_json_blob(text or "")
+    if blob is None:
+        return result
+
+    obj = _tolerant_loads(blob)
+    if obj is None:
+        return result
+
+    tool_calls = _normalize_tool_calls(obj)
+    if tool_calls:
+        result.tool_calls = tool_calls
+        result.parsed_ok = True
+        return result
+
+    if isinstance(obj, dict) and "content" in obj:
+        content = obj.get("content")
+        result.content = content if isinstance(content, str) else json.dumps(content)
+        result.parsed_ok = True
+        return result
+
+    # A valid JSON object without tool_calls/content: treat it as the content
+    # payload (e.g. a response_format json_object answer).
+    if isinstance(obj, (dict, list)):
+        result.content = json.dumps(obj, ensure_ascii=False)
+        result.parsed_ok = True
+
+    return result
+
+
+def needs_reformulation(parsed: ParsedAgentResponse) -> bool:
+    """Return True when the parsed reply is unusable and should be retried."""
+    return not parsed.parsed_ok
+
+
+def to_openai_tool_calls(tool_calls: list[ToolCall]) -> list[dict[str, Any]]:
+    """Render parsed tool calls in OpenAI ``message.tool_calls`` format."""
+    out: list[dict[str, Any]] = []
+    for call in tool_calls:
+        out.append(
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            }
+        )
+    return out

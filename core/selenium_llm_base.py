@@ -229,6 +229,11 @@ class SeleniumLLMBase:
         # standard webdriver.Chrome fallback on the next driver init attempt.
         self._prefer_webdriver_fallback: bool = False
 
+        # Set per-request by generate_response(): when True the request is part
+        # of the agentic (tool-calling) lane and short JSON replies must not be
+        # discarded by the page-state junk filter.
+        self._agent_mode: bool = False
+
         # Per-engine total timeout override (seconds). Set by JsonEngine from
         # the JSON config key "total_timeout". None means use the computed default.
         self._total_timeout: int | None = None
@@ -815,6 +820,7 @@ class SeleniumLLMBase:
 
     async def generate_response(
         self, prompt: str, media: list[Any] | None = None, timeout: int | None = None,
+        agent_mode: bool = False,
     ) -> str:
         """Send prompt and optional media to the LLM service and return the response text.
 
@@ -828,7 +834,13 @@ class SeleniumLLMBase:
             (navigation + input + response).  ``None`` uses the default of
             300 s (5 min), overridable via the ``SELENIUM_TOTAL_TIMEOUT``
             environment variable.
+        agent_mode:
+            When True the request is part of the agentic (tool-calling) lane.
+            Structured JSON replies must NOT be discarded as page-state junk,
+            so ``_looks_like_response_text_junk`` is relaxed for this request.
         """
+        # Signal downstream helpers (junk filter) that JSON output is expected.
+        self._agent_mode = bool(agent_mode)
         # Compute effective timeout: per-call > per-engine from JSON > env var > computed default
         if timeout is not None:
             total_timeout = int(timeout)
@@ -1998,7 +2010,12 @@ class SeleniumLLMBase:
         if len(stripped) > 300:
             return False
 
-        if stripped.startswith("{") or stripped.startswith("["):
+        # In agent mode the model is expected to emit short structured JSON
+        # (tool calls / final content). Do not treat that JSON as junk — only
+        # keep the memory/recovery state-dump guards below active.
+        if not self._agent_mode and (
+            stripped.startswith("{") or stripped.startswith("[")
+        ):
             try:
                 json.loads(stripped)
                 logger.debug(

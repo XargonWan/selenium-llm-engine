@@ -159,6 +159,81 @@ If the chosen engine supports audio uploads, use `type: "input_audio"` with a ba
 }
 ```
 
+## Agentic (tool-calling) mode
+
+`/v1/chat/completions` automatically switches to an **agentic lane** when the
+request carries any OpenAI agentic field:
+
+- `tools` (non-empty list of function definitions)
+- `tool_choice`
+- `response_format` (e.g. `{"type": "json_object"}`)
+
+You can also force it explicitly with `"mode": "agent"`.
+
+In this mode the server injects a JSON-only harness into the prompt so the
+browser-driven model answers with a single structured JSON object, then parses
+that reply back into standard OpenAI `tool_calls`.
+
+Example request with tools:
+
+```bash
+curl -X POST "http://localhost:14848/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "chatgpt",
+    "messages": [{"role": "user", "content": "What is the weather in Rome?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+When the model decides to call a tool the response uses the standard OpenAI
+shape (`content` is `null`, `finish_reason` is `tool_calls`):
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_0",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+When the model gives a final answer instead, `finish_reason` is `stop` and the
+text is returned in `message.content` as usual.
+
+**Notes and limits:**
+
+- The agentic lane is **stateless**: the caller must re-send the full
+  conversation (including previous `tool_calls` and `tool` results) on every
+  request, exactly as with the OpenAI API.
+- Output is **best-effort**. If the model's first reply cannot be parsed, the
+  server issues a bounded number of *reformulation* retries nudging it back to
+  valid JSON. If it still fails, the raw text is returned as `content`.
+- Real token streaming is not supported for tool calls; the response is
+  delivered once parsing completes.
+- The feature is fully **engine-agnostic** — it works with any configured
+  engine and requires no engine-specific configuration.
+
 3. Prompt example (API call)
 
 Before sending a prompt, make sure you have logged in using `/login/chatgpt` or `/login/gemini`.
