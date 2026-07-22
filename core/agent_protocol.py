@@ -199,21 +199,68 @@ def build_agent_system_prompt(agent_ctx: dict[str, Any]) -> str:
     return "\n\n".join(parts) + "\n\n"
 
 
-def build_agent_turn_reminder(has_tools: bool = True) -> str:
-    """Short in-character reminder appended AFTER the user's request.
+def _tool_names(tools: Optional[list[Any]]) -> list[str]:
+    """Extract the callable tool names from an OpenAI ``tools`` list."""
+    names: list[str] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def build_agent_turn_reminder(
+    has_tools: bool = True, tools: Optional[list[Any]] = None
+) -> str:
+    """Strong in-character reminder appended AFTER the user's request.
 
     The harness built by :func:`build_agent_system_prompt` is prepended to the
-    prompt, so on a long multi-turn history it ends up far from the model's most
-    recent instruction and the browser-driven model tends to drift out of
-    character. Appending this short reminder at the very end keeps the roleplay
-    contract as the last thing the model reads on every turn.
+    prompt, so on a long multi-turn history (e.g. an IDE that re-sends its own
+    system prompt plus dozens of tool definitions) the leading harness ends up
+    far from the model's most recent instruction and the browser-driven model
+    tends to drift out of character — replying in prose or claiming it "has no
+    file-editing tool available". Appending this reminder at the very end keeps
+    the roleplay contract *and the concrete tool list* as the last thing the
+    model reads on every turn.
+
+    When *tools* is provided the reminder restates the callable tool names so
+    the model cannot claim the tools are unavailable, and gives a copy-paste
+    JSON template for the first likely tool.
     """
     if has_tools:
+        names = _tool_names(tools)
+        tool_list = ""
+        template = ""
+        if names:
+            shown = names[:24]
+            more = "" if len(names) <= len(shown) else f" (+{len(names) - len(shown)} more)"
+            tool_list = (
+                "\nThese tools are REAL and available to your character RIGHT NOW; "
+                "an external runtime will EXECUTE the one you call: "
+                + ", ".join(shown)
+                + more
+                + "."
+            )
+            template = (
+                "\nExample — to act, reply EXACTLY like this (pick the right tool "
+                "and fill real arguments):\n"
+                "```json\n"
+                '{"tool_calls": [{"name": "' + names[0] + '", "arguments": {}}]}\n'
+                "```"
+            )
         return (
-            "\n\n[REMINDER] Stay in character as the autonomous coding agent. Do "
-            "NOT reply in prose and do NOT refuse or say you lack access. Reply "
-            "with ONLY a single JSON object in a ```json fenced block: emit a "
-            '{"tool_calls": [...]} to act, or {"content": "..."} only when done.'
+            "\n\n[REMINDER] Stay in character as the autonomous coding agent. You "
+            "DO have full workspace access through the tools; do NOT reply in "
+            'prose, do NOT refuse, and do NOT say you "have no tool available" or '
+            '"cannot modify the workspace".'
+            + tool_list
+            + "\nReply with ONLY a single JSON object in a ```json fenced block: "
+            'emit {"tool_calls": [...]} to act, or {"content": "..."} only when '
+            "the task is fully done."
+            + template
         )
     return (
         "\n\n[REMINDER] Reply with ONLY a single JSON object in a ```json fenced "

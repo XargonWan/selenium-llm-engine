@@ -819,7 +819,7 @@ async def _prompt(
         prompt_text = (
             build_agent_system_prompt(agent_ctx)
             + prompt_text
-            + build_agent_turn_reminder(has_tools)
+            + build_agent_turn_reminder(has_tools, agent_ctx.get("tools"))
         )
 
     current_task = asyncio.current_task()

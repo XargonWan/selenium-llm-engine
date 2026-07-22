@@ -112,6 +112,14 @@ def test_build_agent_turn_reminder_with_tools():
     assert "tool_calls" in reminder
 
 
+def test_build_agent_turn_reminder_lists_tool_names():
+    """When tools are passed, the reminder must restate the concrete tool names
+    (and a JSON template) so the model cannot claim they are unavailable."""
+    reminder = build_agent_turn_reminder(has_tools=True, tools=[_WEATHER_TOOL])
+    assert _WEATHER_TOOL["function"]["name"] in reminder
+    assert "tool_calls" in reminder
+
+
 def test_build_agent_turn_reminder_without_tools():
     reminder = build_agent_turn_reminder(has_tools=False).lower()
     assert "json" in reminder
