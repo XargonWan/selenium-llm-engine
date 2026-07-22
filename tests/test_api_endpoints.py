@@ -2600,6 +2600,28 @@ def test_split_prompt_into_parts_chunks_within_limit():
         assert len(part) <= max_chunk
 
 
+def test_split_prompt_keeps_tail_marker_in_final_chunk():
+    """When the protected tail marker is present, everything after it must land
+    intact in the LAST chunk and the marker itself must be stripped."""
+    from core.selenium_llm_base import SeleniumLLMBase
+    from core.agent_protocol import AGENT_TAIL_MARKER
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    head = "H" * 300
+    tail = "[REMINDER] call tool_x now"
+    prompt = head + "\n\n" + AGENT_TAIL_MARKER + "\n" + tail
+    parts = engine._split_prompt_into_parts(prompt, 3)
+    # The tail must be the final chunk, whole, with no marker leaking through.
+    assert parts[-1] == tail
+    assert AGENT_TAIL_MARKER not in "".join(parts)
+    # The head is spread across the earlier chunks.
+    assert "".join(parts[:-1]).startswith("H")
+
+
 def test_execute_chunked_send_invokes_driver_n_times():
     """_execute_chunked_send must call _fill_input and _click_send once per chunk."""
     from core.selenium_llm_base import SeleniumLLMBase
@@ -3205,6 +3227,79 @@ def test_agent_mode_reformulation_gives_up_gracefully():
     # No empty response: raw text is returned as content.
     assert choice["finish_reason"] == "stop"
     assert choice["message"]["content"] == "I cannot produce JSON, sorry."
+
+
+def _collect_stream_chunks(resp):
+    """Parse an SSE agent stream into its chat.completion.chunk objects."""
+    chunks = []
+    for line in resp.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        body = line.removeprefix("data:").strip()
+        if body == "[DONE]":
+            continue
+        chunks.append(json.loads(body))
+    return chunks
+
+
+def test_agent_mode_streaming_emits_tool_calls():
+    """stream=True in agent mode must emit structured tool_calls, not raw JSON."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = (
+        '```json\n{"tool_calls": [{"name": "get_weather", '
+        '"arguments": {"city": "Rome"}}]}\n```'
+    )
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Weather in Rome?"}],
+            "tools": [_WEATHER_TOOL],
+            "stream": True,
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        chunks = _collect_stream_chunks(resp)
+    # A tool_calls delta and a tool_calls finish_reason must be present.
+    tool_deltas = [
+        c for c in chunks if c["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert len(tool_deltas) == 1
+    tc = tool_deltas[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert tc["function"]["name"] == "get_weather"
+    finish_reasons = [c["choices"][0]["finish_reason"] for c in chunks]
+    assert "tool_calls" in finish_reasons
+
+
+def test_agent_mode_streaming_reformulates_content_with_tools():
+    """stream=True: a first {content:...} promise while tools exist must be
+    reformulated (same as the non-streaming path) into a real tool call."""
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = [
+        '```json\n{"content": "Procedo ad aggiornare la web UI."}\n```',
+        '```json\n{"tool_calls": [{"name": "get_weather", '
+        '"arguments": {"city": "Rome"}}]}\n```',
+    ]
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "Make the UI purple."}],
+            "tools": [_WEATHER_TOOL],
+            "stream": True,
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        chunks = _collect_stream_chunks(resp)
+    # The promise was reformulated: both scripted replies were consumed and the
+    # final stream carries a tool call, not the textual promise.
+    assert engine.next_response == []
+    tool_deltas = [
+        c for c in chunks if c["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert len(tool_deltas) == 1
 
 
 def test_non_agent_request_unchanged():

@@ -38,6 +38,15 @@ logger = logging.getLogger("agent_protocol")
 # when the model wraps it in prose or markdown.
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# Opaque boundary marker prepended to the turn reminder. When a prompt is too
+# long and has to be sent to the browser UI in several sequential chunks, the
+# chunker keeps everything from this marker onward in a single, final chunk so
+# the reminder (and the concrete tool list) is the LAST thing the model reads
+# before it answers — instead of being split across chunk boundaries and buried
+# under the IDE's own system prompt. The engine layer treats this as an opaque
+# string and never inspects its contents, preserving engine-agnosticism.
+AGENT_TAIL_MARKER = "<<<AGENT_TAIL>>>"
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -252,7 +261,8 @@ def build_agent_turn_reminder(
                 "```"
             )
         return (
-            "\n\n[REMINDER] Stay in character as the autonomous coding agent. You "
+            "\n\n" + AGENT_TAIL_MARKER + "\n"
+            "[REMINDER] Stay in character as the autonomous coding agent. You "
             "DO have full workspace access through the tools; do NOT reply in "
             'prose, do NOT refuse, and do NOT say you "have no tool available" or '
             '"cannot modify the workspace".'
@@ -263,7 +273,8 @@ def build_agent_turn_reminder(
             + template
         )
     return (
-        "\n\n[REMINDER] Reply with ONLY a single JSON object in a ```json fenced "
+        "\n\n" + AGENT_TAIL_MARKER + "\n"
+        "[REMINDER] Reply with ONLY a single JSON object in a ```json fenced "
         'block of the form {"content": "..."} — no prose outside the JSON.'
     )
 
@@ -419,9 +430,28 @@ def parse_agent_response(text: str) -> ParsedAgentResponse:
     return result
 
 
-def needs_reformulation(parsed: ParsedAgentResponse) -> bool:
-    """Return True when the parsed reply is unusable and should be retried."""
-    return not parsed.parsed_ok
+def needs_reformulation(
+    parsed: ParsedAgentResponse, has_tools: bool = False
+) -> bool:
+    """Return True when the parsed reply is unusable and should be retried.
+
+    Two cases trigger a retry:
+
+    1. The reply did not parse into a usable JSON object at all.
+    2. *Structural* refusal detection (language-agnostic): when tools were
+       available but the model answered with a final ``{"content": ...}`` and
+       **no** ``tool_calls``, it declined to act. Instead of matching refusal
+       phrases per language (unmaintainable across every locale), we rely on
+       the shape of the reply: a first-turn ``content`` while tools exist means
+       the task was not attempted, so we reformulate. If the model still
+       insists with ``content`` after the bounded retries, the caller accepts
+       it as the final answer.
+    """
+    if not parsed.parsed_ok:
+        return True
+    if has_tools and not parsed.tool_calls and parsed.content is not None:
+        return True
+    return False
 
 
 def to_openai_tool_calls(tool_calls: list[ToolCall]) -> list[dict[str, Any]]:

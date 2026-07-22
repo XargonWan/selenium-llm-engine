@@ -126,6 +126,20 @@ def test_build_agent_turn_reminder_without_tools():
     assert "content" in reminder
 
 
+def test_build_agent_turn_reminder_carries_tail_marker():
+    """The reminder must be prefixed with the protected tail marker so the
+    chunker can keep it intact in the final chunk of an oversized prompt."""
+    from core.agent_protocol import AGENT_TAIL_MARKER
+
+    with_tools = build_agent_turn_reminder(has_tools=True, tools=[_WEATHER_TOOL])
+    without_tools = build_agent_turn_reminder(has_tools=False)
+    assert AGENT_TAIL_MARKER in with_tools
+    assert AGENT_TAIL_MARKER in without_tools
+    # The marker precedes the reminder body in both branches.
+    assert with_tools.index(AGENT_TAIL_MARKER) < with_tools.index("[REMINDER]")
+    assert without_tools.index(AGENT_TAIL_MARKER) < without_tools.index("[REMINDER]")
+
+
 def test_build_agent_system_prompt_without_tools():
     prompt = build_agent_system_prompt({"tools": []})
     assert "[AGENT MODE]" in prompt
@@ -251,6 +265,29 @@ def test_parse_json_object_without_content_becomes_content():
 def test_needs_reformulation():
     assert needs_reformulation(ParsedAgentResponse(parsed_ok=False)) is True
     assert needs_reformulation(ParsedAgentResponse(parsed_ok=True, content="x")) is False
+
+
+def test_needs_reformulation_content_with_tools_is_structural():
+    """Language-agnostic: a final content while tools were available means the
+    model declined to act, so we reformulate — regardless of the language of
+    the excuse. Without tools the same content is a legitimate final answer."""
+    # A content reply in any language triggers a retry when tools existed.
+    for text in (
+        "I can't edit files",
+        "Non ho strumenti di modifica",
+        "Ich habe keine Werkzeuge",  # German
+        "我没有编辑文件的工具",  # Chinese
+    ):
+        parsed = ParsedAgentResponse(parsed_ok=True, content=text)
+        assert needs_reformulation(parsed, has_tools=True) is True
+        assert needs_reformulation(parsed, has_tools=False) is False
+
+    # A genuine tool call never needs reformulation.
+    with_call = ParsedAgentResponse(
+        parsed_ok=True,
+        tool_calls=[ToolCall(id="c0", name="edit_file", arguments={})],
+    )
+    assert needs_reformulation(with_call, has_tools=True) is False
 
 
 def test_to_openai_tool_calls_shape():

@@ -25,6 +25,8 @@ from selenium.common.exceptions import StaleElementReferenceException, TimeoutEx
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from core.agent_protocol import AGENT_TAIL_MARKER
+
 logger = logging.getLogger("selenium_llm_base")
 
 # Global lock that serialises Chrome initialisation across all engine instances.
@@ -1101,7 +1103,30 @@ class SeleniumLLMBase:
         return len(prompt) > limit
 
     def _split_prompt_into_parts(self, prompt: str, n: int) -> list[str]:
-        """Split *prompt* into *n* roughly equal text chunks."""
+        """Split *prompt* into *n* roughly equal text chunks.
+
+        If the prompt carries a protected tail marker (an opaque boundary the
+        caller inserts to keep a trailing instruction intact), everything from
+        that marker onward is kept as a single final chunk so it reaches the
+        model whole — never split across chunk boundaries. The marker itself is
+        stripped from the text that is actually sent. This layer treats the
+        marker as opaque and never inspects the tail's contents.
+        """
+        marker_pos = prompt.rfind(AGENT_TAIL_MARKER)
+        if marker_pos != -1:
+            head = prompt[:marker_pos]
+            tail = prompt[marker_pos + len(AGENT_TAIL_MARKER):].lstrip("\n")
+            # Reserve the final slot for the protected tail; split the head into
+            # the remaining n-1 parts (at least 1).
+            head_parts_n = max(n - 1, 1)
+            head_chunk_size = max(math.ceil(len(head) / head_parts_n), 1)
+            head_parts = [
+                head[i : i + head_chunk_size]
+                for i in range(0, len(head), head_chunk_size)
+            ]
+            if not head_parts:
+                head_parts = [""]
+            return head_parts + [tail]
         chunk_size = math.ceil(len(prompt) / n)
         return [prompt[i : i + chunk_size] for i in range(0, len(prompt), chunk_size)]
 
@@ -1124,6 +1149,10 @@ class SeleniumLLMBase:
         min_parts = math.ceil(len(prompt) / limit)
         n = min(self._split_prompt_parts, max(min_parts, 2))
         parts = self._split_prompt_into_parts(prompt, n)
+        # The tail-marker path may return a different part count than requested
+        # (it reserves a dedicated final chunk for the protected tail), so keep
+        # n in sync with what was actually produced to drive the send loop.
+        n = len(parts)
         chunk_t0 = time.time()
         logger.info(
             f"[selenium] Prompt chunking: {len(prompt)} chars split into {n} parts "
@@ -1463,8 +1492,14 @@ class SeleniumLLMBase:
                 prompt = self._inline_response_prefix + prompt
 
         # Prompt chunking: split oversized prompts into sequential parts.
+        # (The tail marker, if any, is handled inside _execute_chunked_send.)
         if not self._skip_split_for_next and not media and self._should_split_prompt(prompt):
             return self._execute_chunked_send(prompt, driver)
+
+        # Non-chunked path: the tail marker is only a chunk-boundary hint, so
+        # strip it before sending the prompt as a single message.
+        if AGENT_TAIL_MARKER in prompt:
+            prompt = prompt.replace(AGENT_TAIL_MARKER, "")
 
         stale_retries = 0
         while True:
