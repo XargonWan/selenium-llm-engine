@@ -377,6 +377,29 @@
             <div id="log-content" class="log-box"></div>
         </div>
 
+        <!-- ===== Debug Mode ===== -->
+        <div class="card" style="grid-column: span 2;">
+            <h2>Debug Mode
+                <span id="debug-state-badge" style="font-size:0.75rem; margin-left:10px; padding:2px 8px; border-radius:10px; background:#555; color:#fff;">off</span>
+            </h2>
+            <p style="font-size:0.85rem; color:var(--text-muted); margin:0 0 10px;">
+                Disabled by default. When on, every prompt lifecycle is traced:
+                input prompt, generated chunks, output reply, target engine and
+                the input&rarr;output time. Can also be enabled at startup via the
+                <code>SELENIUM_DEBUG</code> environment variable.
+            </p>
+            <div class="filter-row">
+                <label style="display:flex; align-items:center; gap:6px; white-space:nowrap;">
+                    <input id="debug-toggle" type="checkbox" onchange="toggleDebug(this.checked)" /> Enable debug tracing
+                </label>
+                <label style="display:flex; align-items:center; gap:6px; white-space:nowrap;">
+                    <input id="debug-autoscroll" type="checkbox" checked /> Auto scroll
+                </label>
+                <button onclick="clearDebugLog()" style="font-size:0.85rem;">&#x2716; Clear</button>
+            </div>
+            <div id="debug-content" class="log-box"></div>
+        </div>
+
     </div><!-- .grid -->
 
     <!-- Login state banner -->
@@ -961,6 +984,113 @@
         }
 
         // ----------------------------------------------------------------
+        // Debug mode
+        // ----------------------------------------------------------------
+        var _lastDebugSeq   = 0;
+        var _debugPollTimer = null;
+
+        function _updateDebugBadge(enabled) {
+            var badge  = document.getElementById('debug-state-badge');
+            var toggle = document.getElementById('debug-toggle');
+            if (toggle) toggle.checked = !!enabled;
+            if (!badge) return;
+            badge.textContent = enabled ? 'on' : 'off';
+            badge.style.background = enabled ? '#2e7d32' : '#555';
+        }
+
+        async function refreshDebugState() {
+            try {
+                var st = await fetchJson('/api/debug');
+                _updateDebugBadge(st.enabled);
+            } catch (_) { /* silent */ }
+        }
+
+        async function toggleDebug(enabled) {
+            try {
+                var st = await fetchJson('/api/debug', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: !!enabled }),
+                });
+                _updateDebugBadge(st.enabled);
+            } catch (err) {
+                alert('Debug toggle failed: ' + err.message);
+                refreshDebugState();
+            }
+        }
+
+        function _fmtDebugEvent(e) {
+            var esc = function(s) {
+                return String(s == null ? '' : s)
+                    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            };
+            var head = '[' + e.ts + '] ' + (e.kind || '').toUpperCase()
+                + ' \u2192 ' + esc(e.engine);
+            var meta = [];
+            if (e.model)      meta.push('model=' + esc(e.model));
+            if (e.stream != null)  meta.push('stream=' + e.stream);
+            if (e.agent_mode)      meta.push('agent');
+            if (e.media_count)     meta.push('media=' + e.media_count);
+            if (e.index != null)   meta.push('chunk ' + e.index + '/' + e.total);
+            if (e.size != null)    meta.push(e.size + ' chars');
+            if (e.elapsed_ms != null) meta.push(e.elapsed_ms + 'ms');
+            if (meta.length) head += ' (' + meta.join(', ') + ')';
+            var body = '';
+            var payload = e.prompt || e.text || e.reply || e.error;
+            if (payload != null) {
+                body = '\n' + esc(payload);
+            }
+            return head + body;
+        }
+
+        function _debugKindClass(kind) {
+            if (kind === 'error')  return 'log-ERROR';
+            if (kind === 'chunk')  return 'log-DEBUG';
+            if (kind === 'output') return 'log-INFO';
+            return 'log-WARNING';
+        }
+
+        async function pollDebugLog() {
+            var box = document.getElementById('debug-content');
+            if (!box) return;
+            try {
+                var data   = await fetchJson('/api/debug/log?since=' + _lastDebugSeq);
+                _updateDebugBadge(data.enabled);
+                var events = data.events || [];
+                if (events.length > 0) {
+                    var frag = document.createDocumentFragment();
+                    events.forEach(function(e) {
+                        var line = document.createElement('div');
+                        line.className = _debugKindClass(e.kind);
+                        line.style.whiteSpace = 'pre-wrap';
+                        line.textContent = _fmtDebugEvent(e);
+                        frag.appendChild(line);
+                    });
+                    box.appendChild(frag);
+                    _lastDebugSeq = events[events.length - 1].seq;
+                    var cb = document.getElementById('debug-autoscroll');
+                    if (cb && cb.checked) box.scrollTop = box.scrollHeight;
+                }
+            } catch (_) { /* silent */ }
+        }
+
+        function startDebugPolling() {
+            if (_debugPollTimer !== null) return;
+            refreshDebugState();
+            pollDebugLog();
+            _debugPollTimer = setInterval(function() {
+                if (document.visibilityState !== 'hidden') pollDebugLog();
+            }, 2000);
+        }
+
+        async function clearDebugLog() {
+            var box = document.getElementById('debug-content');
+            if (box) box.innerHTML = '';
+            _lastDebugSeq = 0;
+            try { await fetchJson('/api/debug/clear', { method: 'POST' }); } catch (_) {}
+        }
+
+        // ----------------------------------------------------------------
         // Init
         // ----------------------------------------------------------------
         window.addEventListener('load', function() {
@@ -969,6 +1099,7 @@
             loadEngines();
             refreshStats();
             startLogPolling();
+            startDebugPolling();
         });
     </script>
 </body>

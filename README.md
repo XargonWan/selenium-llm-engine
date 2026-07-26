@@ -14,7 +14,13 @@ Feel free to submit pull requests with improvements, new engines, or engine defi
 
 </br>
 > [!NOTE]
-> The application listens on port `8000` by default. Docker Compose maps this to `14848` in this repository, but you can change this mapping freely in `docker-compose.yml`.
+> The API (including the web admin UI at `/ui`) listens on port `8000` by
+> default over plain **HTTP**. Docker Compose maps this to `14848` in this
+> repository, but you can change this mapping freely in `docker-compose.yml`.
+> The webtop remote desktop is a separate service served by Selkies on port
+> `3001` over **HTTPS** — it does not expose the API routes (there is no
+> `/ui` on `3001`). Access the admin UI at `http://<host>:14848/ui`, not on
+> `3001`.
 
 
 ## Features
@@ -33,6 +39,7 @@ Feel free to submit pull requests with improvements, new engines, or engine defi
   - `/chat/completions` (OpenAI-like legacy compatibility)
   - `/stats` (aggregated counters + response time averages)
   - `/api/logs/app` (incremental app log polling)
+  - `/api/debug` (get/set debug mode) and `/api/debug/log` (debug trace polling)
   - `/api/engines/selector-hints` (runtime selector hints)
   - `/reset` and `/api/reset` (clears engine state and stats counters)
   - `/api/session/kill` (force-kills frozen browser session processes)
@@ -53,7 +60,7 @@ docker pull xargonwan/selenium-llm-engine:latest
 
 docker run -d --name selenium-llm-engine \
   -p 14848:8000 \
-  -p 3001:3000 \
+  -p 3001:3001 \
   -v data:/app/data \
   -v config:/config \
   xargonwan/selenium-llm-engine:latest
@@ -116,6 +123,45 @@ payload = {
 r = requests.post(url, json=payload)
 print(r.json())
 ```
+
+## Debug mode
+
+Debug mode traces everything that flows through the engine and is **disabled by
+default**. When enabled it records, into an in-memory ring buffer, the full
+prompt lifecycle:
+
+- the input prompt,
+- the chunks generated when an oversized prompt is split,
+- the output reply,
+- the target engine,
+- the total time from input to output (`elapsed_ms`).
+
+It can be enabled in two ways:
+
+- **Environment variable** at startup — set `SELENIUM_DEBUG` to one of
+  `1`/`true`/`yes`/`on` (case-insensitive):
+
+  ```bash
+  docker run -d --name selenium-llm-engine \
+    -e SELENIUM_DEBUG=true \
+    -p 14848:8000 -p 3001:3001 \
+    -v data:/app/data -v config:/config \
+    xargonwan/selenium-llm-engine:latest
+  ```
+
+- **Web UI / API** at runtime — toggle it from the *Debug Mode* card in `/ui`,
+  or via the API:
+
+  ```bash
+  # read state
+  curl http://localhost:14848/api/debug
+  # enable
+  curl -X POST http://localhost:14848/api/debug -H 'Content-Type: application/json' -d '{"enabled": true}'
+  # read trace events (incremental)
+  curl 'http://localhost:14848/api/debug/log?since=0'
+  ```
+
+A runtime toggle overrides the environment default until the process restarts.
 
 ## Media upload support
 
@@ -279,7 +325,7 @@ cd selenium-llm-engine
 docker compose up --build
 ```
 
-This runs the same service under `http://localhost:14848` (and `http://localhost:3001` for webtop).
+This runs the same service under `http://localhost:14848` (and `https://localhost:3001` for the webtop remote desktop).
 
 ## Directory structure
 

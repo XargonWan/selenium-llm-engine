@@ -26,6 +26,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from core.agent_protocol import AGENT_TAIL_MARKER
+from core import debug_mode
 
 logger = logging.getLogger("selenium_llm_base")
 
@@ -1158,6 +1159,7 @@ class SeleniumLLMBase:
             f"[selenium] Prompt chunking: {len(prompt)} chars split into {n} parts "
             f"(limit={limit}, env_max={self._split_prompt_parts})"
         )
+        _engine_name = getattr(self, "ENGINE_NAME", "default")
 
         def _intermediate_text(idx: int, part: str) -> str:
             header = (
@@ -1168,6 +1170,10 @@ class SeleniumLLMBase:
         # --- Send first chunk ---
         first_text = _intermediate_text(1, parts[0])
         logger.debug(f"[selenium] Sending chunk 1/{n} ({len(first_text)} chars)")
+        debug_mode.record_event(
+            "chunk", _engine_name, index=1, total=n, size=len(first_text),
+            text=first_text,
+        )
         input_el = self._find_interactable_element(
             driver, self.prompt_area_selectors, timeout=20.0,
             cache_attr="_cached_prompt_selector",
@@ -1205,6 +1211,10 @@ class SeleniumLLMBase:
 
             self._fill_input(driver, input_el, next_text)
             logger.debug(f"[selenium] Filled chunk {idx} ({len(next_text)} chars)")
+            debug_mode.record_event(
+                "chunk", _engine_name, index=idx, total=n, size=len(next_text),
+                text=next_text,
+            )
 
             # Step 2: Wait for send button (LLM finished processing chunk idx-1)
             chunk_timeout = 30.0 if is_final else 5.0

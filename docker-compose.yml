@@ -6,6 +6,8 @@ services:
     ports:
       - "14848:8000"  # API port
       - "3001:3001"   # webtop interface
+    # environment:
+    #   - SELENIUM_DEBUG=true  # trace prompts/chunks/replies (default: off)
     volumes:
       - data:/app/data
       - config:/config

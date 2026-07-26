@@ -45,6 +45,7 @@ from core.agent_protocol import (
     to_openai_tool_calls,
 )
 from core.engine_manager import EngineManager
+from core import debug_mode
 from core.models import (
     ChatCompletion,
     LegacyModelList,
@@ -844,6 +845,15 @@ async def _prompt(
 
     inc_requests()
     start = time.time()
+    debug_mode.record_event(
+        "input",
+        engine_name,
+        model=model_name,
+        stream=stream,
+        agent_mode=agent_mode,
+        media_count=len(media_items),
+        prompt=prompt_text,
+    )
     try:
         mgr = EngineManager.get()
 
@@ -913,6 +923,14 @@ async def _prompt(
                         "ok",
                         elapsed_ms,
                     )
+                    debug_mode.record_event(
+                        "output",
+                        engine_name,
+                        model=result_obj.model_name,
+                        stream=True,
+                        elapsed_ms=elapsed_ms,
+                        reply=result_obj.text,
+                    )
                     inc_responses()
                     chunk_id = f"llm_{int(time.time())}"
                     if agent_parsed is not None and agent_parsed.tool_calls:
@@ -946,6 +964,13 @@ async def _prompt(
                     elapsed_ms = int((time.time() - start) * 1000)
                     log_prompt(
                         engine_name, "unknown", prompt_text, str(e), "error", elapsed_ms
+                    )
+                    debug_mode.record_event(
+                        "error",
+                        engine_name,
+                        stream=True,
+                        elapsed_ms=elapsed_ms,
+                        error=str(e),
                     )
                     inc_errors()
                     raise HTTPException(status_code=500, detail=str(e))
@@ -994,6 +1019,14 @@ async def _prompt(
             "ok",
             duration_ms,
         )
+        debug_mode.record_event(
+            "output",
+            engine_name,
+            model=result_obj.model_name,
+            stream=False,
+            elapsed_ms=duration_ms,
+            reply=result_obj.text,
+        )
         inc_responses()
 
         return _openai_response(
@@ -1015,6 +1048,13 @@ async def _prompt(
             "error",
             duration_ms,
         )
+        debug_mode.record_event(
+            "error",
+            engine_name,
+            stream=stream,
+            elapsed_ms=duration_ms,
+            error="cancelled due to reset",
+        )
         inc_errors()
         raise HTTPException(status_code=503, detail="Request cancelled due to reset")
     except HTTPException:
@@ -1022,6 +1062,13 @@ async def _prompt(
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         log_prompt(engine_name, "unknown", prompt_text, str(e), "error", duration_ms)
+        debug_mode.record_event(
+            "error",
+            engine_name,
+            stream=stream,
+            elapsed_ms=duration_ms,
+            error=str(e),
+        )
         inc_errors()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1085,6 +1132,41 @@ async def app_logs(since: int = 0) -> Dict[str, Any]:
     with _LOG_BUFFER_LOCK:
         entries = [e for e in _LOG_BUFFER if e["seq"] > since]
     return {"entries": entries}
+
+
+@app.get("/api/debug")
+async def get_debug_state() -> Dict[str, Any]:
+    """Return the current debug-mode state."""
+    return debug_mode.status()
+
+
+@app.post("/api/debug")
+async def set_debug_state(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Enable or disable debug mode at runtime.
+
+    Body: ``{"enabled": true|false}``.
+    """
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400, detail="Body must contain boolean 'enabled'"
+        )
+    debug_mode.set_debug(enabled)
+    logger.info("[debug] Debug mode %s via API", "enabled" if enabled else "disabled")
+    return debug_mode.status()
+
+
+@app.get("/api/debug/log")
+async def debug_log(since: int = 0) -> Dict[str, Any]:
+    """Return buffered debug-trace events with seq > since (incremental polling)."""
+    return {"events": debug_mode.get_events(since), "enabled": debug_mode.debug_enabled()}
+
+
+@app.post("/api/debug/clear")
+async def debug_clear() -> Dict[str, Any]:
+    """Clear the debug-trace event buffer."""
+    debug_mode.clear_events()
+    return {"status": "ok"}
 
 
 @app.get("/api/engines/selector-hints")
