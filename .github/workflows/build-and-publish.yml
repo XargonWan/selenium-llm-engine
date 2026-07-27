@@ -15,7 +15,7 @@ jobs:
     outputs:
       TAG: ${{ steps.version.outputs.TAG }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Get short commit
@@ -48,7 +48,7 @@ jobs:
       IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/selenium-llm-engine
       IMAGE_TAG: ${{ needs.prepare.outputs.TAG || github.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -87,7 +87,7 @@ jobs:
       - name: Save image digest artifact
         run: |
           echo "${{ steps.build.outputs.digest }}" > digest-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: digest-${{ matrix.arch }}
           path: digest-${{ matrix.arch }}
@@ -121,8 +121,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install deps
