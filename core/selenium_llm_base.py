@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +30,16 @@ from core.agent_protocol import AGENT_TAIL_MARKER
 from core import debug_mode
 
 logger = logging.getLogger("selenium_llm_base")
+
+# Matches a bare error line that carries a numeric failure code, e.g.
+# "Something went wrong (1076)", "Error 1076" or a lone parenthesised
+# "(1076)". Requires either an explicit error keyword next to the code or the
+# code to be parenthesised on its own, so a normal short reply ending in a
+# number (e.g. "The answer is 1200") is not misclassified.
+_NUMERIC_ERROR_CODE_RE = re.compile(
+    r"(?:\berror\b\s*#?\s*\d{3,5})|(?:^\(\d{3,5}\)$)",
+    re.IGNORECASE,
+)
 
 # Global lock that serialises Chrome initialisation across all engine instances.
 # Prevents concurrent _cleanup_chromium_remnants() calls from killing each
@@ -193,6 +204,13 @@ class SeleniumLLMBase:
         ]
         self.accept_button_selectors: list[str] = []
         self.limit_selectors: list[str] = []
+        # CSS selectors that match a transient error banner/toast/snackbar the web
+        # UI shows when a generation fails (e.g. "Something went wrong (1076)").
+        # Such errors are typically rendered outside the response area, so the
+        # normal response-text detection never sees them and the request would
+        # otherwise stall until timeout. Populated from the JSON "error_indicators"
+        # key; empty by default to keep the core engine-agnostic.
+        self.error_indicator_selectors: list[str] = []
         # CSS selectors whose matching elements must never be clicked as send button
         self.send_button_blacklist: list[str] = []
 
@@ -960,6 +978,16 @@ class SeleniumLLMBase:
                     stripped[:200],
                 )
                 return True
+        # Numeric error codes shown by some web UIs on a bare error line, e.g.
+        # "Something went wrong (1076)" or "Error 1076". Only treat a short line
+        # as an error so a long, legitimate reply that merely mentions "error"
+        # somewhere is not misclassified.
+        if len(stripped) <= 80 and _NUMERIC_ERROR_CODE_RE.search(stripped):
+            logger.warning(
+                "[selenium] Detected numeric error-code response: %r",
+                stripped[:200],
+            )
+            return True
         return False
 
     def _quit_driver_with_timeout(self, driver: Any, timeout: int = 5) -> None:
@@ -1051,6 +1079,42 @@ class SeleniumLLMBase:
             except Exception:
                 pass
         return False
+
+    def _get_error_indicator_text(self, driver: Any) -> Optional[str]:
+        """Return the text of a visible error banner/toast if one is present.
+
+        Some web UIs render generation failures (e.g. "Something went wrong
+        (1076)") in a transient snackbar/toast *outside* the response area, so
+        the normal response-text detection never sees them and the request would
+        stall until timeout. This checks the configured ``error_indicator``
+        selectors and, when one matches a visible element, returns its text (or a
+        generic marker) so the caller can fail fast and retry.
+
+        Returns ``None`` when no error indicator is present or none are
+        configured (keeping behaviour unchanged for engines without the key).
+        """
+        for selector in self.error_indicator_selectors:
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                continue
+            for el in els:
+                try:
+                    if not self._element_is_displayed(el):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    text = (el.text or "").strip()
+                except Exception:
+                    text = ""
+                logger.warning(
+                    "[selenium] Error indicator matched selector %r: %r",
+                    selector,
+                    text[:200],
+                )
+                return text or "engine error indicator detected"
+        return None
 
     def _wait_for_page_ready(self, driver: Any, timeout: float = 30.0) -> bool:
         """Wait for page readyState complete, then wait for any prompt-area selector
@@ -3207,6 +3271,67 @@ class SeleniumLLMBase:
                             "page_refresh_required: %s — page refreshed, retry without driver reset" % freeze_reason
                         )
                 raise TimeoutException("%s detected during generation" % freeze_reason)
+
+            error_text = self._get_error_indicator_text(driver)
+            if error_text:
+                try:
+                    debug_mode.record_event(
+                        "error",
+                        getattr(self, "ENGINE_NAME", "default"),
+                        stage="response_wait",
+                        detail="error_indicator_detected",
+                        text=error_text[:500],
+                    )
+                except Exception:
+                    pass
+                # A transient engine error (e.g. "Something went wrong (1076)")
+                # leaves a toast/snackbar and, for chunked prompts, a partial
+                # conversation on the page. Navigate back to the service home so
+                # a fresh, empty chat is started (a plain refresh could restore
+                # the partial conversation), then let the caller resend the
+                # *entire* prompt from scratch (re-chunking if needed). This is
+                # faster than a full driver reset and preserves the login
+                # session/cookies.
+                if self._page_refresh_attempts < self._max_page_refresh_attempts:
+                    recovered = False
+                    try:
+                        logger.info(
+                            "[selenium] Engine error indicator detected — "
+                            "navigating to service home to recover "
+                            "(attempt %d/%d): %s",
+                            self._page_refresh_attempts + 1,
+                            self._max_page_refresh_attempts,
+                            error_text[:120],
+                        )
+                        driver.get(self.service_url)
+                        self._wait_for_page_ready(driver, timeout=30.0)
+                        self._cached_prompt_selector = None
+                        self._cached_send_selector = None
+                        self._page_refresh_attempts += 1
+                        recovered = True
+                    except Exception as nav_err:
+                        logger.error(
+                            "[selenium] Navigation to service home after engine "
+                            "error failed: %s",
+                            nav_err,
+                        )
+                    if recovered:
+                        # Force a full prompt resend from the top of the flow so
+                        # a chunked prompt is re-sent in its entirety rather than
+                        # resuming mid-sequence on the fresh page.
+                        self._skip_split_for_next = False
+                        raise RuntimeError(
+                            "page_refresh_required: engine error indicator "
+                            "detected — returned to service home, resend full "
+                            "prompt: %s" % error_text[:200]
+                        )
+                # Recovery budget exhausted (or navigation failed): fall back to
+                # the driver-reset retry path so we do not loop forever on a page
+                # that keeps showing the error toast.
+                raise RuntimeError(
+                    "selenium_response_detection_timeout: engine error indicator "
+                    "detected during response wait: %s" % error_text[:200]
+                )
 
             if self._is_limit_present(driver):
                 raise RuntimeError(

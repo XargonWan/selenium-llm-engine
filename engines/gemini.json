@@ -110,6 +110,15 @@
       "button:has(> gem-icon > mat-icon[fonticon='stop'])",
       "mat-icon[aria-label='Stop']",
       "mat-icon[data-mat-icon-name='stop']"
+    ],
+    "error_indicators": [
+      "mat-snack-bar-container simple-snack-bar",
+      "mat-snack-bar-container .mat-mdc-snack-bar-label",
+      "mat-snack-bar-container",
+      ".mat-mdc-snack-bar-container",
+      "snack-bar-container",
+      "[data-test-id='error-message']",
+      ".error-message"
     ]
   },
   "media_support": {

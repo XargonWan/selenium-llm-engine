@@ -124,6 +124,8 @@ class JsonEngine(SeleniumLLMBase):
             self.stop_selectors = list(sel["stop"])
         if "limit" in sel:
             self.limit_selectors = list(sel["limit"])
+        if "error_indicators" in sel:
+            self.error_indicator_selectors = list(sel["error_indicators"])
         if "send_button_blacklist" in sel:
             self.send_button_blacklist = list(sel["send_button_blacklist"])
         self.base_account_selector = sel.get("base_account_selector")

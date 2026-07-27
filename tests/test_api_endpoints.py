@@ -984,6 +984,128 @@ def test_captcha_detection_short_circuit(monkeypatch):
     assert "Please complete" in result
 
 
+def test_json_engine_loads_error_indicator_selectors():
+    """Gemini renders transient failures ("Something went wrong (1076)") in an
+    Angular Material snackbar outside the response area. Ensure the JSON
+    ``error_indicators`` selectors are loaded so they can be detected."""
+    from pathlib import Path
+    from core.json_engine import JsonEngine
+
+    engines_dir = Path(__file__).parent.parent / "engines"
+    engine = JsonEngine(engines_dir / "gemini.json")
+
+    assert "mat-snack-bar-container" in engine.error_indicator_selectors
+    assert "simple-snack-bar" in " ".join(engine.error_indicator_selectors)
+
+
+def test_error_indicator_selectors_default_empty():
+    """Engines without an ``error_indicators`` key keep an empty list so the
+    base engine behaviour is unchanged (engine-agnostic default)."""
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    assert engine.error_indicator_selectors == []
+
+
+def test_get_error_indicator_text_returns_text_when_present():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    class FakeElement:
+        def __init__(self, text):
+            self._text = text
+
+        @property
+        def text(self):
+            return self._text
+
+        def is_displayed(self):
+            return True
+
+    class FakeDriver:
+        def find_elements(self, by, selector):
+            if selector == "mat-snack-bar-container":
+                return [FakeElement("Something went wrong (1076)")]
+            return []
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.error_indicator_selectors = ["mat-snack-bar-container", ".error-message"]
+
+    text = engine._get_error_indicator_text(FakeDriver())
+    assert text == "Something went wrong (1076)"
+
+
+def test_get_error_indicator_text_none_when_not_configured():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    class FakeDriver:
+        def find_elements(self, by, selector):
+            raise AssertionError("find_elements must not be called when unconfigured")
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    # Default empty list -> no lookups, returns None.
+    assert engine._get_error_indicator_text(FakeDriver()) is None
+
+
+def test_get_error_indicator_text_none_when_hidden():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    class HiddenElement:
+        text = "Something went wrong (1076)"
+
+        def is_displayed(self):
+            return False
+
+    class FakeDriver:
+        def find_elements(self, by, selector):
+            return [HiddenElement()]
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine.error_indicator_selectors = ["mat-snack-bar-container"]
+    assert engine._get_error_indicator_text(FakeDriver()) is None
+
+
+def test_is_engine_error_response_detects_something_went_wrong():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    assert engine._is_engine_error_response("Something went wrong (1076)") is True
+    assert engine._is_engine_error_response("Error 1076") is True
+    assert engine._is_engine_error_response("(1076)") is True
+
+
+def test_is_engine_error_response_ignores_normal_reply_with_number():
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    # A legitimate short reply ending in a number must NOT be flagged.
+    assert engine._is_engine_error_response("The answer is 1200") is False
+    assert engine._is_engine_error_response("Room 404 is down the hall") is False
+
+
 def test_check_login_state_no_browser_launch_when_uninitialized():
     from core.selenium_llm_base import SeleniumLLMBase
 
@@ -2383,6 +2505,79 @@ def test_wait_for_response_silent_freeze_resets_driver_after_max_refreshes(monke
 
     # refresh should NOT be called because we are already at max attempts
     mock_driver.refresh.assert_not_called()
+
+
+def test_wait_for_response_error_indicator_navigates_to_service_home(monkeypatch):
+    """Detecting an engine error toast must navigate to the service home.
+
+    When an error indicator (e.g. Gemini "Something went wrong (1076)") is
+    detected during response waiting, the watcher should return to the service
+    home to start a clean chat (rather than a plain refresh that could restore
+    the partial conversation) and raise page_refresh_required so the caller
+    resends the full prompt without a full driver reset.
+    """
+    import tempfile
+    from core.selenium_llm_base import SeleniumLLMBase
+    from unittest.mock import MagicMock, patch
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com/home",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    # No stop button so the silent-freeze / UI-stuck checks stay inactive and
+    # the error-indicator branch is the one that fires.
+    engine.stop_selectors = []
+    engine.error_indicator_selectors = ["div.error-toast"]
+    engine._max_page_refresh_attempts = 2
+    engine._page_refresh_attempts = 0
+    engine._skip_split_for_next = True
+
+    mock_driver = MagicMock()
+    mock_driver.current_url = "https://example.com/home"
+
+    # No response text ever appears, but an error toast is visible from the
+    # first iteration so the error-indicator branch triggers immediately.
+    def fake_find_elements(by, selector):
+        if selector == "div.error-toast":
+            toast = MagicMock()
+            toast.is_displayed.return_value = True
+            toast.text = "Something went wrong (1076)"
+            return [toast]
+        return []
+
+    mock_driver.find_elements.side_effect = fake_find_elements
+    mock_driver.get = MagicMock()
+    engine._wait_for_page_ready = MagicMock(return_value=True)
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
+    monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "5")
+
+    # Advance the fake clock only slightly per call so the error-indicator branch
+    # fires before the no-progress freeze grace window elapses.
+    fake_time = [1000.0]
+
+    def fake_time_func():
+        fake_time[0] += 0.05
+        return fake_time[0]
+
+    with patch("time.time", side_effect=fake_time_func), \
+         patch("time.sleep", lambda *_: None):
+        with pytest.raises(RuntimeError, match="page_refresh_required"):
+            engine._wait_for_response(mock_driver)
+
+    assert engine._page_refresh_attempts == 1
+    # Navigated to the service home (not a plain refresh).
+    mock_driver.get.assert_called_once_with("https://example.com/home")
+    mock_driver.refresh.assert_not_called()
+    engine._wait_for_page_ready.assert_called_once_with(mock_driver, timeout=30.0)
+    # Selector caches invalidated and full-resend forced for the next attempt.
+    assert engine._cached_prompt_selector is None
+    assert engine._cached_send_selector is None
+    assert engine._skip_split_for_next is False
 
 
 def test_wait_for_response_block_generation_with_stop_button_does_not_refresh(monkeypatch):
