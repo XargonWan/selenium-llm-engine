@@ -3,6 +3,10 @@ FROM ghcr.io/astral-sh/uv:latest AS uv_source
 
 FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
 
+# Provided automatically by Docker Buildx (e.g. "amd64", "arm64"). Re-declared
+# here so it is available inside this build stage for arch-aware COPY below.
+ARG TARGETARCH
+
 # --- Webtop / Selenium environment setup ---
 ENV TITLE="Selenium LLM Engine"
 ENV PIXELFLUX_USE_XSHM=0 \
@@ -59,11 +63,15 @@ RUN pip3 install --no-cache-dir gemini-cli || true
 # (libdav1d6, libdouble-conversion3, libharfbuzz-subset0, libjpeg62-turbo,
 # libminizip1, libopenh264-7, libxnvctrl0). Rather than depend on the Debian
 # repos being reachable at build time, we ALSO vendor those dependency .deb
-# files under vendor/chromium148/deps/ so the entire install is offline and
-# reproducible even if the Debian bookworm repos ever disappear.
+# files under vendor/chromium148/<arch>/deps/ so the entire install is offline
+# and reproducible even if the Debian bookworm repos ever disappear.
+#
+# The vendored packages are split per architecture (amd64/, arm64/) because the
+# multi-arch build produces both linux/amd64 and linux/arm64 images. TARGETARCH
+# selects the matching set at build time.
 #
 # Pinned: chromium / chromium-common / chromium-driver 148.0.7778.215-1~deb12u1
-COPY vendor/chromium148/ /tmp/chromium148/
+COPY vendor/chromium148/${TARGETARCH}/ /tmp/chromium148/
 RUN apt-get update && \
     apt-get purge -y google-chrome google-chrome-stable || true && \
     # Install the vendored Debian-flavoured runtime deps first (offline), then
