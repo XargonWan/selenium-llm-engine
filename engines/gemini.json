@@ -86,6 +86,10 @@
       "article"
     ],
     "accept_button": [
+      "button[data-test-id='read-more-button']",
+      "cookie-banner div.action-buttons button[aria-label*='Reject']",
+      "cookie-banner div.action-buttons button[aria-label*='Rifiuta']",
+      "cookie-banner > div > div.banner-body > div.action-buttons.body-actions > div > button:nth-child(2)",
       "upload-image-disclaimer-dialog button[data-test-id='upload-image-agree-button']",
       "upload-image-disclaimer-dialog button[aria-label*='Agree']",
       "#mat-mdc-dialog-1 > div > div > digital-wellbeing-nudge > div > div.digital-wellbeing-nudge-actions > button > span.mat-mdc-button-touch-target",
