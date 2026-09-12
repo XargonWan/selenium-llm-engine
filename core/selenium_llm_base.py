@@ -51,6 +51,63 @@ _CHROMIUM_INIT_LOCK = threading.Lock()
 _shared_driver: Optional[Any] = None
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its children (process tree).
+
+    Uses pkill -P to kill children first, then the parent.
+    """
+    try:
+        # Kill children first
+        subprocess.run(
+            ["pkill", "-9", "-P", str(pid)],
+            check=False, capture_output=True, timeout=2,
+        )
+        # Then kill the parent
+        subprocess.run(
+            ["kill", "-9", str(pid)],
+            check=False, capture_output=True, timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def _quit_driver_with_timeout(driver: Any, timeout: int = 5) -> bool:
+    """Attempt ``driver.quit()`` with a hard timeout, then force-kill the process tree.
+
+    Returns True if quit() completed normally, False if force-killed.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(driver.quit)
+        try:
+            fut.result(timeout=timeout)
+            return True
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "[selenium] driver.quit() did not finish within %ds — force killing process tree",
+                timeout,
+            )
+        except Exception as exc:
+            logger.warning("[selenium] driver.quit() error: %s", exc)
+
+    # Force kill the chromedriver process tree
+    try:
+        # Find chromedriver processes and kill their trees
+        for pattern in ["chromedriver", "undetected_chromedriver"]:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    check=False, capture_output=True, timeout=2, text=True,
+                )
+                for pid_str in result.stdout.strip().split():
+                    if pid_str.isdigit():
+                        _kill_process_tree(int(pid_str))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 def shutdown_shared_driver() -> None:
     """Quit the shared Chrome driver and clean up all Chromium processes.
 
@@ -61,17 +118,8 @@ def shutdown_shared_driver() -> None:
         drv = _shared_driver
         _shared_driver = None
     if drv is not None:
-        # Use a timeout so we don't hang on a dead ChromeDriver process.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(drv.quit)
-            try:
-                fut.result(timeout=5)
-            except concurrent.futures.TimeoutError:
-                logger.warning(
-                    "[selenium] shared driver quit() timed out after 5s"
-                )
-            except Exception as exc:
-                logger.warning("[selenium] shared driver quit error: %s", exc)
+        # Use timeout with guaranteed force-kill
+        _quit_driver_with_timeout(drv, timeout=5)
     # Kill any remaining Chromium processes and remove lock files.
     profile_dir = os.getenv(
         "CHROMIUM_PROFILE_DIR", "/config/.config/chromium-synth"
@@ -259,9 +307,27 @@ class SeleniumLLMBase:
         # the JSON config key "total_timeout". None means use the computed default.
         self._total_timeout: int | None = None
 
+        # Per-engine session hard timeout (seconds): maximum wall-clock time
+        # a single session (driver instance) can live before being force-reset.
+        # This prevents renderer processes from running indefinitely (e.g. 2+ days).
+        # Set by JsonEngine from the JSON config key "session_hard_timeout".
+        # None means use the SELENIUM_SESSION_HARD_TIMEOUT env default (300s).
+        self._session_hard_timeout: int | None = None
+
         # Some engines (Gemini) work more reliably when response detection uses
         # stable text instead of comparing against prior baseline text.
         self._use_baseline_comparison: bool = True
+
+        # Some web chats stop accepting messages after the first exchange in a
+        # conversation: the send button is clicked but the prompt is never
+        # submitted. Such engines must open a fresh chat for every request.
+        # Set by JsonEngine from the JSON config key "fresh_chat_per_request".
+        self._fresh_chat_per_request: bool = False
+
+        # One-shot flag raised when an attempt fails: the page it ran on is
+        # suspect, so the next attempt navigates to a fresh chat instead of
+        # retrying in place on the same, possibly blocked, conversation.
+        self._navigate_on_next_attempt: bool = False
 
         # Per-engine "silent freeze" threshold (seconds): how long the stop button
         # may stay visible with no response-text activity before the page is
@@ -643,6 +709,7 @@ class SeleniumLLMBase:
             self.driver.set_page_load_timeout(120)
             self.driver.set_script_timeout(120)
             self._initialized = True
+            self._driver_start_time = time.time()  # Track session start for hard timeout
             _shared_driver = self.driver
             logger.info("[selenium] Driver initialized successfully (shared)")
             return self.driver
@@ -990,23 +1057,12 @@ class SeleniumLLMBase:
             return True
         return False
 
-    def _quit_driver_with_timeout(self, driver: Any, timeout: int = 5) -> None:
-        """Attempt ``driver.quit()`` with a hard timeout.
+    def _quit_driver_with_timeout(self, driver: Any, timeout: int = 5) -> bool:
+        """Attempt ``driver.quit()`` with a hard timeout, then force-kill the process tree.
 
-        If the driver process is dead or unresponsive, ``quit()`` blocks
-        indefinitely waiting for an HTTP reply from ChromeDriver.  This
-        wrapper caps the wait so that callers can proceed to cleanup.
+        Returns True if quit() completed normally, False if force-killed.
         """
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(driver.quit)
-            try:
-                fut.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                logger.warning(
-                    "[selenium] driver.quit() did not finish within %ds", timeout
-                )
-            except Exception as exc:
-                logger.warning("[selenium] driver.quit() error: %s", exc)
+        return _quit_driver_with_timeout(driver, timeout)
 
     def _kill_chromium_processes(self) -> None:
         """Immediately SIGKILL all Chromium processes (fast variant of cleanup)."""
@@ -1041,6 +1097,7 @@ class SeleniumLLMBase:
             self._initialized = False
             self._cookies_restored = False
             self._page_refresh_attempts = 0
+            self._driver_start_time = None  # Reset session timer
         self._kill_chromium_processes()
 
     def _reset_driver(self) -> None:
@@ -1054,6 +1111,7 @@ class SeleniumLLMBase:
         self._initialized = False
         self._cookies_restored = False
         self._page_refresh_attempts = 0
+        self._driver_start_time = None  # Reset session timer
         self._cleanup_chromium_remnants()
 
     def _is_captcha_present(self, driver: Any) -> bool:
@@ -1244,6 +1302,7 @@ class SeleniumLLMBase:
         )
         if input_el is None:
             raise RuntimeError(f"Could not find prompt input area for chunk 1/{n}")
+        pre_send_text = self._read_pre_send_text(driver)
         self._fill_input(driver, input_el, first_text)
         self._click_accept_buttons(driver, timeout=2.0)
         self._click_send(driver, input_el)
@@ -1273,6 +1332,7 @@ class SeleniumLLMBase:
             if input_el is None:
                 raise RuntimeError(f"Could not find prompt input area for chunk {idx}/{n}")
 
+            pre_send_text = self._read_pre_send_text(driver)
             self._fill_input(driver, input_el, next_text)
             logger.debug(f"[selenium] Filled chunk {idx} ({len(next_text)} chars)")
             debug_mode.record_event(
@@ -1319,7 +1379,9 @@ class SeleniumLLMBase:
                         raise RuntimeError(
                             "redirect-stall: final chunk not accepted by UI after send"
                         )
-                    response = self._wait_for_response(driver)
+                    response = self._wait_for_response(
+                        driver, pre_send_text=pre_send_text
+                    )
 
                     # ── post-response cleanup ────────────────────────────────
                     # Same as in _sync_generate_response_once: if the stop button
@@ -1414,6 +1476,18 @@ class SeleniumLLMBase:
                 if attempt >= max_attempts - 1:
                     raise
 
+                # The page this attempt ran on is suspect (e.g. a conversation
+                # that stopped accepting messages): retry on a fresh chat. Log it
+                # here too, since several failure paths (chunked sends among
+                # them) otherwise reach the next attempt without any trace.
+                logger.warning(
+                    "[selenium] Attempt %d/%d failed: %s — retrying on a fresh chat",
+                    attempt + 1,
+                    max_attempts,
+                    e,
+                )
+                self._navigate_on_next_attempt = True
+
                 if isinstance(e, RuntimeError):
                     if self._is_page_refresh_required(e):
                         if self._page_refresh_attempts < self._max_page_refresh_attempts:
@@ -1489,6 +1563,30 @@ class SeleniumLLMBase:
         looping forever.
         """
         t0 = time.time()
+        
+        # Session hard timeout watchdog: if the driver has been alive longer than
+        # the session hard timeout, force-reset it to prevent renderer processes
+        # from running indefinitely (e.g. 2+ days at 27.6% CPU).
+        session_hard_timeout = self._session_hard_timeout
+        if session_hard_timeout is None:
+            session_hard_timeout = int(os.getenv("SELENIUM_SESSION_HARD_TIMEOUT", "300"))
+        if hasattr(self, '_driver_start_time') and self._driver_start_time:
+            if (time.time() - self._driver_start_time) > session_hard_timeout:
+                logger.warning(
+                    "[selenium] Session hard timeout (%ds) exceeded — force-resetting driver",
+                    session_hard_timeout,
+                )
+                self._force_reset_driver()
+                # Re-initialize after reset
+                self._ensure_ready()
+                assert self.driver is not None
+                driver = cast(webdriver.Chrome, self.driver)
+            else:
+                driver = cast(webdriver.Chrome, self.driver)
+        else:
+            self._driver_start_time = time.time()
+            driver = cast(webdriver.Chrome, self.driver)
+
         self._ensure_ready()
 
         unlogged = not self.is_user_logged_in()
@@ -1505,8 +1603,21 @@ class SeleniumLLMBase:
         try:
             current_url = driver.current_url or ""
             if current_url.startswith(self.service_url):
-                needs_nav = False
-                logger.debug("[selenium] Already on service URL, skipping navigation")
+                fresh_chat = getattr(self, "_fresh_chat_per_request", False)
+                retry_nav = getattr(self, "_navigate_on_next_attempt", False)
+                if fresh_chat or retry_nav:
+                    # Engines are driven statelessly (see agent_protocol): reusing
+                    # an already-used conversation can leave the next prompt
+                    # typed but never submitted.
+                    logger.debug(
+                        "[selenium] On service URL but a fresh chat is required "
+                        "(fresh_chat_per_request=%s, retry=%s) — navigating",
+                        fresh_chat,
+                        retry_nav,
+                    )
+                else:
+                    needs_nav = False
+                    logger.debug("[selenium] Already on service URL, skipping navigation")
         except Exception:
             pass  # dead session or no URL — navigate anyway
 
@@ -1521,6 +1632,8 @@ class SeleniumLLMBase:
                     ) from nav_err
                 raise
             self._wait_for_page_ready(driver, timeout=30.0)
+
+        self._navigate_on_next_attempt = False
 
         t1 = time.time()
         logger.info(f"[timing] page_ready: {t1 - t0:.2f}s")
@@ -1588,6 +1701,7 @@ class SeleniumLLMBase:
                 t2 = time.time()
                 logger.info(f"[timing] find_element: {t2 - t1:.2f}s")
 
+                pre_send_text = self._read_pre_send_text(driver)
                 self._fill_input(driver, input_el, prompt)
                 t3 = time.time()
                 logger.info(f"[timing] fill_input: {t3 - t2:.2f}s ({len(prompt)} chars)")
@@ -1623,7 +1737,9 @@ class SeleniumLLMBase:
                 t5 = time.time()
                 logger.info(f"[timing] post_send_check: {t5 - t4:.2f}s")
 
-                response = self._wait_for_response(driver)
+                response = self._wait_for_response(
+                    driver, pre_send_text=pre_send_text
+                )
 
                 # ── engine error detection ───────────────────────────────────
                 # If the response text looks like an LLM web UI error (e.g.
@@ -1691,7 +1807,12 @@ class SeleniumLLMBase:
                     raise RuntimeError(f"Driver session died mid-prompt: {e}") from e
                 logger.error(f"[selenium] _sync_generate_response_once failed: {e}")
                 if unlogged:
-                    return f"⚠️ Unlogged session: could not run full prompt flow. Error: {e}"
+                    # Never hand the caller an error string dressed up as a model
+                    # reply: it gets stored as a successful prompt and forwarded
+                    # downstream as if it were content.
+                    raise RuntimeError(
+                        f"Unlogged session: could not run full prompt flow. Error: {e}"
+                    ) from e
                 raise
 
     # ------------------------------------------------------------------ media helpers
@@ -2495,6 +2616,44 @@ class SeleniumLLMBase:
     def _normalize_input_text(self, text: str) -> str:
         return " ".join(text.replace("\r\n", "\n").strip().split())
 
+    # Typing very long text through ChromeDriver is slow enough to hit its HTTP
+    # read timeout, and ChromeDriver cannot type anything outside the Basic
+    # Multilingual Plane at all (emoji raise "only supports characters in the
+    # BMP"). Both were observed in production, so the keyboard fallback is only
+    # used for short, BMP-safe text.
+    SEND_KEYS_MAX_CHARS = 5000
+
+    @staticmethod
+    def _is_bmp_safe(text: str) -> bool:
+        return all(ord(c) <= 0xFFFF for c in text)
+
+    def _send_keys_is_safe(self, text: str) -> bool:
+        limit = int(
+            os.getenv("SELENIUM_SEND_KEYS_MAX_CHARS", str(self.SEND_KEYS_MAX_CHARS))
+        )
+        return len(text) <= limit and self._is_bmp_safe(text)
+
+    def _log_insert_mismatch(self, current: str, text: str) -> None:
+        """Explain why the JS insert was not accepted, so the cause is visible."""
+        cur_c = self._strip_all_whitespace(current)
+        exp_c = self._strip_all_whitespace(text)
+        diff_at = next(
+            (i for i, (a, b) in enumerate(zip(cur_c, exp_c)) if a != b),
+            min(len(cur_c), len(exp_c)),
+        )
+        logger.warning(
+            "[selenium] JS insert not verified: editor has %d chars, expected %d "
+            "(first difference at %d)",
+            len(cur_c),
+            len(exp_c),
+            diff_at,
+        )
+        logger.warning(
+            "[selenium] JS insert mismatch context: editor=%r expected=%r",
+            cur_c[max(0, diff_at - 60) : diff_at + 60],
+            exp_c[max(0, diff_at - 60) : diff_at + 60],
+        )
+
     def _get_input_text(self, driver: Any, element: Any) -> str:
         try:
             tag = (element.tag_name or "").lower()
@@ -2622,16 +2781,51 @@ class SeleniumLLMBase:
                     # Verify execCommand actually populated the editor.  If the content
                     # does not match (editor ignored execCommand or retained stale text),
                     # fall back to native key events: select-all + delete + type.
+                    # Poll briefly: a large insert may still be rendering, and a
+                    # single immediate read was enough to send perfectly good
+                    # text down the keyboard fallback.
                     exec_ok = False
-                    try:
-                        current = self._get_input_text(driver, element)
-                        exec_ok = self._strip_all_whitespace(
-                            current
-                        ) == self._strip_all_whitespace(text)
-                    except Exception:
-                        exec_ok = False
+                    current = ""
+                    expected_compact = self._strip_all_whitespace(text)
+                    deadline = time.time() + 1.5
+                    while True:
+                        try:
+                            current = self._get_input_text(driver, element)
+                            exec_ok = (
+                                self._strip_all_whitespace(current) == expected_compact
+                            )
+                        except Exception:
+                            exec_ok = False
+                        if exec_ok or time.time() >= deadline:
+                            break
+                        time.sleep(0.1)
 
-                    if not exec_ok:
+                    if not exec_ok and not self._send_keys_is_safe(text):
+                        # Typing this is either impossible (non-BMP) or slow enough
+                        # to time ChromeDriver out. Re-insert via JS and let the
+                        # final verification decide: it raises a retryable error.
+                        self._log_insert_mismatch(current, text)
+                        logger.warning(
+                            "[selenium] Not typing %d chars through the keyboard "
+                            "(bmp_safe=%s); retrying the JS insert instead",
+                            len(text),
+                            self._is_bmp_safe(text),
+                        )
+                        try:
+                            driver.execute_script(
+                                "const el = arguments[0];"
+                                "el.focus();"
+                                "document.execCommand('selectAll', false, null);"
+                                "document.execCommand('insertText', false, arguments[1]);",
+                                element,
+                                text,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[selenium] JS insert retry failed: %s", exc
+                            )
+                    elif not exec_ok:
+                        self._log_insert_mismatch(current, text)
                         try:
                             element.click()
                         except Exception:
@@ -3067,7 +3261,24 @@ class SeleniumLLMBase:
         logger.debug("[selenium] post_send_check: timeout but URL looks ok — assuming slow model")
         return True
 
-    def _wait_for_response(self, driver: Any, max_wait: int = 120) -> str:
+    def _read_pre_send_text(self, driver: Any) -> str:
+        """Return the latest response text on screen, or ``""`` if unreadable.
+
+        Taken immediately before a prompt is filled and sent, this is the only
+        reliable reference for spotting a stale page: any read after the send
+        can already contain the new answer, since short replies are often
+        complete before the post-send wait even starts.
+        """
+        try:
+            text = self._get_latest_response_text(driver)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("[selenium] Could not read pre-send text: %s", exc)
+            return ""
+        return text if isinstance(text, str) else ""
+
+    def _wait_for_response(
+        self, driver: Any, max_wait: int = 120, pre_send_text: str | None = None
+    ) -> str:
         """Wait for the LLM response to fully stream, then return its text.
 
         Strategy:
@@ -3188,6 +3399,23 @@ class SeleniumLLMBase:
 
                 if stable_counter >= 2:
                     response = self._extract_response_text_from_element(driver, container)
+                    if (
+                        response
+                        and pre_send_text
+                        and not self._generation_was_active
+                        and response.strip() == pre_send_text.strip()
+                    ):
+                        # Stable, byte-identical to what was on screen *before* this
+                        # prompt was sent, and nothing on the page changed while we
+                        # waited: the new answer never rendered and this is the
+                        # previous turn's text. The reference must be captured
+                        # before the send -- a post-send read may already hold a
+                        # short, complete, genuinely new answer. Without a pre-send
+                        # snapshot the guard stays off rather than guess.
+                        raise RuntimeError(
+                            "Stale response: the text is unchanged from before the "
+                            "prompt was sent and no generation activity was observed"
+                        )
                     if response:
                         logger.debug(
                             "[selenium] watcher detected stable response after %d iterations",
@@ -3368,9 +3596,17 @@ class SeleniumLLMBase:
             return
 
         deadline = time.time() + float(timeout)
+        # A consent flow is not always a single button: a banner may have to be
+        # expanded before the button that dismisses it exists in the DOM. Keep
+        # looking after a successful click instead of returning on the first
+        # hit, and remember which selectors already fired so an always-present
+        # control is not clicked over and over.
+        clicked_selectors: set[str] = set()
         while time.time() < deadline:
             clicked_any = False
             for sel in self.accept_button_selectors:
+                if sel in clicked_selectors:
+                    continue
                 try:
                     buttons = driver.find_elements(By.CSS_SELECTOR, sel)
                 except Exception:
@@ -3381,6 +3617,7 @@ class SeleniumLLMBase:
                         if button.is_displayed() and button.is_enabled():
                             button.click()
                             clicked_any = True
+                            clicked_selectors.add(sel)
                             logger.debug(
                                 f"[selenium] Clicked accept button with selector: {sel}"
                             )
@@ -3388,6 +3625,10 @@ class SeleniumLLMBase:
                         continue
 
             if clicked_any:
+                # Let the DOM settle so a step revealed by this click is seen.
+                time.sleep(0.25)
+                continue
+            if clicked_selectors:
                 return
             time.sleep(0.25)
 
