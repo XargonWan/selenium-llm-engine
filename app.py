@@ -3,11 +3,14 @@ import base64
 import json
 import logging
 import mimetypes
+import os
+import signal
 import threading
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Set
 
@@ -302,22 +305,65 @@ logging.basicConfig(level=logging.INFO)
 # Attach after basicConfig so the root logger already exists
 logging.getLogger().addHandler(_buf_handler)
 
+# Also persist to disk. Until now the container's stdout was the only copy, so
+# every diagnosis needed `docker logs` and nothing survived a recreate -- the
+# per-step [timing] lines that explain a stuck prompt were simply unavailable
+# to anyone reading a mounted log directory.
+_LOG_DIR = Path(os.getenv("SELENIUM_LOG_DIR", "./logs"))
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        _LOG_DIR / "selenium-llm-engine.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    _file_handler.setLevel(logging.INFO)
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
+    )
+    logging.getLogger().addHandler(_file_handler)
+except OSError as exc:  # pragma: no cover - read-only or absent mount
+    logging.getLogger().warning(
+        "[logging] Cannot write log file in %s: %s", _LOG_DIR, exc
+    )
+
 logger = logging.getLogger("selenium-llm-api")
+
+
+# Signal handling for graceful shutdown
+_shutdown_event = asyncio.Event()
+
+
+def _signal_handler(sig: int) -> None:
+    logger.info(f"[signal] Received signal {sig}, initiating graceful shutdown...")
+    _shutdown_event.set()
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
     # ---- startup ----
     init_database()
-    EngineManager.get()           # initialize manager
-    _register_engine_routes(app)  # dynamic per-engine /name/prompt routes
+    manager = EngineManager.get()           # initialize manager
+    manager.start_orphan_cleanup()          # start periodic orphan cleanup
+    _register_engine_routes(app)            # dynamic per-engine /name/prompt routes
+
+    # Register signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler, sig)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
     yield
+
     # ---- shutdown ----
     # Gracefully quit all Chrome instances so they can flush cookies/profile to
     # disk before the container is killed.  This keeps login sessions alive
     # across docker stop / docker restart.
     try:
-        manager = EngineManager.get()
         await asyncio.wait_for(manager.stop_all(), timeout=15)
     except Exception as exc:
         logger.warning(f"[shutdown] stop_all error: {exc}")
@@ -746,8 +792,17 @@ async def openai_chat(req: Request) -> Any:
         try:
             engine = mgr._resolve(engine_hint)
         except ValueError:
-            # Fall back to configured default engine for unrecognised names
+            # Fall back to configured default engine for unrecognised names.
+            # Announce it: routing a request to a different provider than the
+            # caller asked for is otherwise indistinguishable from success.
             engine = mgr.get_default_engine()
+            logger.warning(
+                "[openai_compat] Unknown engine '%s' (from model '%s'); "
+                "routing to default engine '%s' instead",
+                engine_hint,
+                model,
+                engine,
+            )
             model = engine
 
     if "prompt" in data:
