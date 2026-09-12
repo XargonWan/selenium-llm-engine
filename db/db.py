@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS stats (
 )
 """
 
+CREATE_SETTINGS = """
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
 
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
@@ -48,9 +55,50 @@ def init_database() -> None:
             cur = conn.cursor()
             cur.execute(CREATE_PROMPT_LOGS)
             cur.execute(CREATE_STATS)
+            cur.execute(CREATE_SETTINGS)
             conn.commit()
         finally:
             conn.close()
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Return the persisted value for *key*, or *default* when it is unset."""
+    with DB_LOCK:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(f"Cannot read setting '{key}': {exc}")
+            return default
+        finally:
+            conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> bool:
+    """Persist *value* under *key*, replacing any previous value.
+
+    Returns ``True`` when the value was stored. A readonly database is not a
+    fatal condition: the caller keeps its in-memory value and we log instead.
+    """
+    with DB_LOCK:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning(f"Cannot persist setting '{key}': {exc}")
+            return False
+        finally:
+            conn.close()
+    return True
 
 
 def log_prompt(

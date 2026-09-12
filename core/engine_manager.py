@@ -31,6 +31,8 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
+import subprocess
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +47,11 @@ logger = logging.getLogger("engine_manager")
 # Root of the project (parent of the ``core/`` package directory).
 _PROJECT_ROOT = Path(__file__).parent.parent
 _ENGINES_DIR = _PROJECT_ROOT / "engines"
+
+# Key under which the default engine is persisted, so a default chosen through
+# the API survives a restart instead of reverting to whichever engine sorts
+# first in engines/.
+_DEFAULT_ENGINE_SETTING = "default_engine"
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +337,11 @@ class EngineManager:
         # providing the scaffolding for future parallel-session support.
         self._job_queues: dict[str, asyncio.Queue[_PromptJob]] = {}
         self._queue_workers: dict[str, list[asyncio.Task]] = {}  # type: ignore[type-arg]
+        # Periodic orphan cleanup task — kills chromedriver/chromium processes
+        # that are older than the configured threshold and no longer owned.
+        self._orphan_cleanup_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._load_descriptors()
+        self._restore_default_engine()
 
     @classmethod
     def get(cls) -> "EngineManager":
@@ -409,19 +420,64 @@ class EngineManager:
         self.active_engine = engine
         return engine
 
+    def _restore_default_engine(self) -> None:
+        """Restore the default engine from persistent storage or the environment.
+
+        Without this the attribute starts empty on every boot and
+        :meth:`get_default_engine` silently falls back to whichever engine sorts
+        first, discarding the operator's choice.
+        """
+        from db.db import get_setting
+
+        candidate = get_setting(_DEFAULT_ENGINE_SETTING) or os.getenv(
+            "SELENIUM_DEFAULT_ENGINE"
+        )
+        if not candidate:
+            return
+        try:
+            self.default_engine = self._resolve(candidate)
+        except ValueError:
+            logger.warning(
+                "[engine_manager] Stored default engine '%s' is not among the "
+                "registered engines; ignoring it",
+                candidate,
+            )
+        else:
+            logger.info(
+                "[engine_manager] Restored default engine '%s'", self.default_engine
+            )
+
     def set_default_engine(self, name: str) -> str:
         canonical = self._resolve(name)
         if canonical not in self._descriptors:
             raise ValueError(f"Unknown engine: '{name}'")
         self.default_engine = canonical
+
+        from db.db import set_setting
+
+        if not set_setting(_DEFAULT_ENGINE_SETTING, canonical):
+            logger.warning(
+                "[engine_manager] Default engine '%s' applies to this process "
+                "only; it could not be persisted and will not survive a restart",
+                canonical,
+            )
         return canonical
 
     def get_default_engine(self) -> str:
         if self.default_engine and self.default_engine in self._descriptors:
             return self.default_engine
         if self._descriptors:
-            # Use the first loaded engine as fallback
-            return next(iter(self._descriptors))
+            # No operator choice available: fall back to the first registered
+            # engine, but say so — silently answering with an arbitrary engine
+            # is how a misconfiguration goes unnoticed.
+            fallback = next(iter(self._descriptors))
+            logger.warning(
+                "[engine_manager] No default engine configured; falling back to "
+                "'%s' (first registered). Set one via POST /api/engines/default "
+                "or the SELENIUM_DEFAULT_ENGINE environment variable.",
+                fallback,
+            )
+            return fallback
         raise ValueError("No engines registered")
 
     def get_active_engine(self) -> SeleniumLLMBase:
@@ -605,8 +661,112 @@ class EngineManager:
 
     # ---------------------------------------------------------------------- lifecycle
 
+    def _cleanup_orphans(self) -> int:
+        """Find and kill orphaned chromedriver / chromium processes.
+
+        Kills processes that match known patterns and are older than the
+        configured ``SELENIUM_ORPHAN_AGE_THRESHOLD`` (default 600 s).
+
+        Returns the number of processes killed.
+        """
+        orphan_age = int(os.getenv("SELENIUM_ORPHAN_AGE_THRESHOLD", "600"))
+        killed = 0
+        patterns = ["chromedriver", "undetected_chromedriver", "chromium", "chrome"]
+        try:
+            for pattern in patterns:
+                try:
+                    result = subprocess.run(
+                        ["pgrep", "-f", pattern],
+                        check=False, capture_output=True, timeout=5, text=True,
+                    )
+                    for pid_str in result.stdout.strip().split():
+                        if not pid_str.isdigit():
+                            continue
+                        pid = int(pid_str)
+                        # Check process age via /proc/<pid>/stat
+                        try:
+                            with open(f"/proc/{pid}/stat", "r") as f:
+                                stat = f.read()
+                            # Field 22 is starttime (in clock ticks since boot)
+                            parts = stat.split()
+                            if len(parts) >= 22:
+                                # Read uptime from /proc/uptime
+                                with open("/proc/uptime", "r") as f:
+                                    uptime_sec = float(f.read().split()[0])
+                                # starttime is in clock ticks (typically 100/s)
+                                clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+                                starttime_ticks = int(parts[21])
+                                starttime_sec = starttime_ticks / clk_tck
+                                age_sec = uptime_sec - starttime_sec
+                                if age_sec > orphan_age:
+                                    logger.info(
+                                        "[engine_manager] Killing orphan %s (PID %d, age %.0fs > %ds)",
+                                        pattern, pid, age_sec, orphan_age,
+                                    )
+                                    # Kill process tree
+                                    subprocess.run(
+                                        ["pkill", "-9", "-P", str(pid)],
+                                        check=False, capture_output=True, timeout=2,
+                                    )
+                                    subprocess.run(
+                                        ["kill", "-9", str(pid)],
+                                        check=False, capture_output=True, timeout=2,
+                                    )
+                                    killed += 1
+                        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+                            # Process already gone or inaccessible
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if killed > 0:
+            logger.warning(
+                "[engine_manager] Orphan cleanup killed %d stale processes", killed
+            )
+        return killed
+
+    async def _orphan_cleanup_loop(self) -> None:
+        """Background coroutine that periodically cleans up orphaned processes."""
+        interval = int(os.getenv("SELENIUM_CLEANUP_INTERVAL", "300"))
+        logger.info(
+            "[engine_manager] Orphan cleanup started (interval=%ds, age_threshold=%ds)",
+            interval,
+            int(os.getenv("SELENIUM_ORPHAN_AGE_THRESHOLD", "600")),
+        )
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                killed = await asyncio.to_thread(self._cleanup_orphans)
+                if killed == 0:
+                    logger.debug("[engine_manager] Orphan cleanup: no orphans found")
+            except asyncio.CancelledError:
+                logger.info("[engine_manager] Orphan cleanup task cancelled")
+                return
+            except Exception as exc:
+                logger.warning("[engine_manager] Orphan cleanup error: %s", exc)
+
+    def start_orphan_cleanup(self) -> None:
+        """Start the periodic orphan cleanup background task."""
+        if self._orphan_cleanup_task is None or self._orphan_cleanup_task.done():
+            self._orphan_cleanup_task = asyncio.ensure_future(self._orphan_cleanup_loop())
+            logger.info("[engine_manager] Orphan cleanup task started")
+
+    async def stop_orphan_cleanup(self) -> None:
+        """Cancel the periodic orphan cleanup task."""
+        if self._orphan_cleanup_task and not self._orphan_cleanup_task.done():
+            self._orphan_cleanup_task.cancel()
+            try:
+                await self._orphan_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self._orphan_cleanup_task = None
+        logger.info("[engine_manager] Orphan cleanup task stopped")
+
     async def stop_all(self) -> None:
         """Save cookies for every engine, then quit the shared Chrome driver."""
+        # First stop the orphan cleanup
+        await self.stop_orphan_cleanup()
         for engine in self.engines.values():
             try:
                 await engine.stop()
