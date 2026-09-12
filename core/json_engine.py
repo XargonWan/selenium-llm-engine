@@ -144,6 +144,10 @@ class JsonEngine(SeleniumLLMBase):
             self._total_timeout = int(config["total_timeout"])
         if "use_baseline_comparison" in config:
             self._use_baseline_comparison = bool(config["use_baseline_comparison"])
+        # Optional JSON key "fresh_chat_per_request": open a new conversation for
+        # every request instead of reusing the page already on the service URL.
+        if "fresh_chat_per_request" in config:
+            self._fresh_chat_per_request = bool(config["fresh_chat_per_request"])
         # Optional JSON key "silent_freeze_threshold" (seconds): how long the stop
         # button may remain visible with no response-text activity before the page
         # is considered stuck. Engines that emit the whole answer in one block
