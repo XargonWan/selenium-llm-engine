@@ -7,6 +7,7 @@
   "response_max_wait": 60,
   "total_timeout": 480,
   "use_baseline_comparison": false,
+  "fresh_chat_per_request": true,
   "silent_freeze_threshold": 45,
   "allow_unlogged": true,
   "models": {
@@ -87,9 +88,11 @@
     ],
     "accept_button": [
       "button[data-test-id='read-more-button']",
-      "cookie-banner div.action-buttons button[aria-label*='Reject']",
-      "cookie-banner div.action-buttons button[aria-label*='Rifiuta']",
-      "cookie-banner > div > div.banner-body > div.action-buttons.body-actions > div > button:nth-child(2)",
+      "cookie-banner button[data-test-id='accept-button']",
+      "cookie-banner div.action-buttons button[aria-label*='Accept']",
+      "cookie-banner div.action-buttons button[aria-label*='Accetta']",
+      "#mat-mdc-dialog-0 > div > div > cookie-banner > div > div.banner-body > div.action-buttons.body-actions > div > button:nth-child(1)",
+      "cookie-banner > div > div.banner-body > div.action-buttons.body-actions > div > button:nth-child(1)",
       "upload-image-disclaimer-dialog button[data-test-id='upload-image-agree-button']",
       "upload-image-disclaimer-dialog button[aria-label*='Agree']",
       "#mat-mdc-dialog-1 > div > div > digital-wellbeing-nudge > div > div.digital-wellbeing-nudge-actions > button > span.mat-mdc-button-touch-target",
