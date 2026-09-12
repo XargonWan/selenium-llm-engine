@@ -3547,3 +3547,468 @@ def test_agent_mode_response_format_triggers_agent():
     assert response.status_code == 200
     assert engine.last_agent_mode is True
 
+
+
+def test_default_engine_survives_manager_restart():
+    """A default chosen through the API must still be set after a restart.
+
+    Regression: ``default_engine`` lived only in memory, so every boot fell back
+    to whichever engine sorts first in ``engines/`` and silently discarded the
+    operator's choice.
+    """
+    response = client.post("/api/engines/default", json={"engine": "gemini"})
+    assert response.status_code == 200
+    assert response.json()["default_engine"] == "gemini"
+
+    original = EngineManager._instance
+    try:
+        # Simulate a process restart: drop the singleton and build a fresh one.
+        EngineManager._instance = None
+        assert EngineManager.get().get_default_engine() == "gemini"
+    finally:
+        EngineManager._instance = original
+
+
+def test_unknown_model_logs_engine_fallback(caplog):
+    """An unresolvable model must not be re-routed to another provider silently.
+
+    Regression: a model name the manager could not resolve fell through to the
+    default engine with no log line, so the request was answered by a different
+    provider than the caller asked for.
+    """
+    import logging
+
+    client.post("/api/engines/default", json={"engine": "gemini"})
+
+    with caplog.at_level(logging.WARNING, logger="selenium-llm-api"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gemini-2.5-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["engine"] == "gemini"
+    assert "routing to default engine" in caplog.text
+    assert "gemini-2.5-flash" in caplog.text
+
+
+def test_unlogged_prompt_failure_raises(monkeypatch):
+    """A failed unlogged prompt must raise instead of returning the error text.
+
+    Regression: the error was handed back as if it were the model's reply, so it
+    was stored as a successful prompt and forwarded downstream as content.
+    """
+    import tempfile
+    from unittest.mock import MagicMock
+
+    import core.selenium_llm_base as slb
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    driver = MagicMock()
+    driver.current_url = "https://example.com"
+    # Take the shared-driver fast path so no real browser is ever started.
+    monkeypatch.setattr(slb, "_shared_driver", driver)
+    engine.driver = driver
+    engine._initialized = True
+
+    engine.is_user_logged_in = lambda: False
+    engine._is_dead_session = lambda exc: False
+    engine._find_interactable_element = (
+        lambda driver, selectors, timeout, cache_attr=None: MagicMock()
+    )
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    # A MagicMock driver answers every lookup truthily, which would otherwise
+    # trip the captcha / usage-limit short circuits before the prompt is typed.
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+
+    def _fail_fill_input(driver, element, prompt):
+        raise RuntimeError(
+            "[selenium] fill_input verification failed: prompt content did not "
+            "match expected text"
+        )
+
+    engine._fill_input = _fail_fill_input
+
+    with pytest.raises(RuntimeError, match="Unlogged session"):
+        engine._sync_generate_response_once("hello")
+
+
+def _stale_guard_engine(monkeypatch, stats_sequence, screen_text="OLD ANSWER"):
+    """Build an engine whose page always shows ``screen_text``.
+
+    ``stats_sequence`` drives ``_get_response_container_stats`` so a test can
+    decide whether the watcher observes generation activity or a page that never
+    moves. ``time.sleep`` is neutralised so the poll loop runs instantly.
+    """
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.response_area_selectors = ["div.response"]
+    engine.stop_selectors = []
+
+    container = MagicMock()
+    stats = iter(stats_sequence)
+    last_stat = stats_sequence[-1]
+
+    def _next_stats(driver, element):
+        nonlocal last_stat
+        last_stat = next(stats, last_stat)
+        return last_stat
+
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    engine._stop_button_present = lambda driver: False
+    # A MagicMock driver answers every lookup truthily, which would otherwise
+    # trip the captcha / usage-limit short circuits inside the wait loop.
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+    engine._log_response_container_diagnostics = lambda *a, **kw: None
+    engine._find_response_container_element = lambda driver: (container, "div.response")
+    engine._get_response_container_stats = _next_stats
+    engine._get_latest_response_text = lambda driver: screen_text
+    engine._extract_response_text_from_element = lambda driver, element: screen_text
+    return engine
+
+
+def test_wait_for_response_rejects_stale_previous_answer(monkeypatch):
+    """A stable page that never changed must not yield the previous answer.
+
+    Regression: detection only asked "did the text stop changing?". A leftover
+    answer from the previous turn is perfectly stable, so it was returned as if
+    freshly generated -- the caller then received the prior turn's reply.
+    """
+    from unittest.mock import MagicMock
+
+    # Metrics never move: nothing was ever generated on the page.
+    engine = _stale_guard_engine(monkeypatch, [(10, 1)])
+
+    with pytest.raises(RuntimeError, match="Stale response"):
+        engine._wait_for_response(MagicMock(), pre_send_text="OLD ANSWER")
+
+
+def test_wait_for_response_allows_identical_answer_after_real_generation(
+    monkeypatch,
+):
+    """An identical answer that actually streamed in must still be returned.
+
+    The stale guard keys on "no generation activity at all", so a model that
+    legitimately repeats itself is not mistaken for a stale page.
+    """
+    from unittest.mock import MagicMock
+
+    # Metrics move first (generation observed), then settle.
+    engine = _stale_guard_engine(monkeypatch, [(3, 1), (7, 1), (10, 1), (10, 1)])
+
+    assert (
+        engine._wait_for_response(MagicMock(), pre_send_text="OLD ANSWER")
+        == "OLD ANSWER"
+    )
+
+
+def test_click_accept_buttons_handles_multi_step_consent(monkeypatch):
+    """A consent banner that must be expanded before it can be dismissed.
+
+    Regression: the helper returned after the first successful click, so the
+    button revealed by that click was never pressed and the banner kept
+    blocking the page — the prompt was sent into a page that never generated,
+    leaving the previous answer on screen.
+    """
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.accept_button_selectors = ["button.expand", "button.dismiss"]
+
+    clicked: list[str] = []
+    expanded = {"value": False}
+
+    def _element(name):
+        el = MagicMock()
+        el.is_displayed.return_value = True
+        el.is_enabled.return_value = True
+
+        def _click():
+            clicked.append(name)
+            if name == "expand":
+                expanded["value"] = True
+
+        el.click.side_effect = _click
+        return el
+
+    def _find_elements(_by, selector):
+        if selector == "button.expand":
+            return [_element("expand")]
+        # The dismiss button only exists once the banner has been expanded.
+        if selector == "button.dismiss" and expanded["value"]:
+            return [_element("dismiss")]
+        return []
+
+    driver = MagicMock()
+    driver.find_elements.side_effect = _find_elements
+
+    engine._click_accept_buttons(driver, timeout=2.0)
+
+    assert clicked == ["expand", "dismiss"]
+
+
+def test_wait_for_response_keeps_short_answer_already_complete(monkeypatch):
+    """A fresh answer finished before the wait started must not be called stale.
+
+    Regression: the guard compared against a text read *after* the send. A
+    short reply such as ``{"biography": ""}`` was often fully rendered by then,
+    so it equalled that read, showed no activity, and was rejected -- then
+    re-sent up to five times by the retry loop.
+    """
+    from unittest.mock import MagicMock
+
+    # The page already shows the complete new answer and never moves again.
+    engine = _stale_guard_engine(monkeypatch, [(18, 1)], screen_text="FRESH ANSWER")
+
+    assert (
+        engine._wait_for_response(MagicMock(), pre_send_text="OLD ANSWER")
+        == "FRESH ANSWER"
+    )
+
+
+def test_wait_for_response_without_pre_send_text_does_not_guess(monkeypatch):
+    """With no pre-send snapshot the guard stays off instead of trusting a
+    post-send read that may already contain the new answer."""
+    from unittest.mock import MagicMock
+
+    engine = _stale_guard_engine(monkeypatch, [(10, 1)])
+
+    assert engine._wait_for_response(MagicMock()) == "OLD ANSWER"
+
+
+class _StopAfterNavigation(Exception):
+    """Raised by a stubbed step to end the prompt flow right after navigation."""
+
+
+def _navigation_probe_engine(monkeypatch, *, fresh_chat: bool, retry_nav: bool = False):
+    """Engine already sitting on its service URL, instrumented to record navigation."""
+    import tempfile
+    import time as _time
+    from unittest.mock import MagicMock
+
+    import core.selenium_llm_base as slb
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    driver = MagicMock()
+    driver.current_url = "https://example.com/app/used-conversation"
+    monkeypatch.setattr(slb, "_shared_driver", driver)
+    engine.driver = driver
+    engine._initialized = True
+    engine._driver_start_time = _time.time()
+    engine._fresh_chat_per_request = fresh_chat
+    engine._navigate_on_next_attempt = retry_nav
+
+    engine.is_user_logged_in = lambda: True
+    engine._is_dead_session = lambda exc: False
+    engine._wait_for_page_ready = lambda driver, timeout=30.0: None
+    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    engine._is_captcha_present = lambda driver: False
+    engine._is_limit_present = lambda driver: False
+    engine._find_interactable_element = (
+        lambda driver, selectors, timeout, cache_attr=None: MagicMock()
+    )
+
+    def _stop(driver, element, prompt):
+        raise _StopAfterNavigation()
+
+    engine._fill_input = _stop
+    return engine, driver
+
+
+def test_fresh_chat_per_request_navigates_even_on_service_url(monkeypatch):
+    """An engine flagged fresh_chat_per_request must not reuse a used conversation.
+
+    Regression: navigation was skipped whenever the browser was already on the
+    service URL. Gemini then received every prompt after the first in the same
+    chat, where the send was clicked but never submitted, so only the first
+    request after a driver reset ever succeeded.
+    """
+    engine, driver = _navigation_probe_engine(monkeypatch, fresh_chat=True)
+
+    with pytest.raises(_StopAfterNavigation):
+        engine._sync_generate_response_once("hello")
+
+    driver.get.assert_called_once_with("https://example.com")
+
+
+def test_without_flag_the_used_page_is_reused(monkeypatch):
+    """Engines that do not opt in keep the existing no-reload behaviour."""
+    engine, driver = _navigation_probe_engine(monkeypatch, fresh_chat=False)
+
+    with pytest.raises(_StopAfterNavigation):
+        engine._sync_generate_response_once("hello")
+
+    driver.get.assert_not_called()
+
+
+def test_retry_after_failed_attempt_opens_a_fresh_chat(monkeypatch):
+    """A failed attempt must not be retried in place on the same page."""
+    engine, driver = _navigation_probe_engine(
+        monkeypatch, fresh_chat=False, retry_nav=True
+    )
+
+    with pytest.raises(_StopAfterNavigation):
+        engine._sync_generate_response_once("hello")
+
+    driver.get.assert_called_once_with("https://example.com")
+    # The one-shot flag is consumed by the navigation it triggered.
+    assert engine._navigate_on_next_attempt is False
+
+
+def test_failed_attempt_flags_navigation_for_the_next_one(monkeypatch):
+    """The retry loop raises the flag between a failed attempt and the next."""
+    import tempfile
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    seen: list[bool] = []
+
+    def _attempt(prompt, media=None):
+        seen.append(engine._navigate_on_next_attempt)
+        if len(seen) == 1:
+            raise RuntimeError(
+                "Stale response: the text is unchanged from before the prompt "
+                "was sent and no generation activity was observed"
+            )
+        return "ok"
+
+    engine._sync_generate_response_once = _attempt
+
+    assert engine._sync_generate_response("hello") == "ok"
+    assert seen == [False, True]
+
+
+def test_failed_attempt_is_logged_before_retry(monkeypatch, caplog):
+    """Every failed attempt leaves a warning, whatever path it failed on."""
+    import logging
+    import tempfile
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    calls = {"n": 0}
+
+    def _attempt(prompt, media=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("final chunk never submitted")
+        return "ok"
+
+    engine._sync_generate_response_once = _attempt
+
+    with caplog.at_level(logging.WARNING, logger="selenium_llm_base"):
+        assert engine._sync_generate_response("hello") == "ok"
+
+    assert "Attempt 1/5 failed: final chunk never submitted" in caplog.text
+
+
+def _failing_js_insert_engine(monkeypatch):
+    """Engine whose editor never accepts the JS insert (read-back stays empty)."""
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    driver = MagicMock()
+    driver.execute_script.return_value = ""  # editor reads back empty → never verified
+    element = MagicMock()
+    element.tag_name = "div"  # contenteditable path
+    return engine, driver, element
+
+
+def test_fill_input_never_types_non_bmp_text(monkeypatch):
+    """Text containing emoji must never reach send_keys.
+
+    Regression: when the JS insert could not be verified, the fallback typed the
+    text through ChromeDriver, which cannot emit anything outside the Basic
+    Multilingual Plane: every turn carrying an emoji died with "only supports
+    characters in the BMP" and the reply never came.
+    """
+    engine, driver, element = _failing_js_insert_engine(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        engine._fill_input(driver, element, "ciao 😵‍💫 come stai")
+
+    assert element.send_keys.call_count == 0
+
+
+def test_fill_input_never_types_very_long_text(monkeypatch):
+    """A huge prompt must not be typed: ChromeDriver times out doing it.
+
+    Regression: a ~32k-char prompt sent through the keyboard fallback hit the
+    ChromeDriver HTTP read timeout after 120s and failed the whole request.
+    """
+    engine, driver, element = _failing_js_insert_engine(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        engine._fill_input(driver, element, "x" * 20000)
+
+    assert element.send_keys.call_count == 0
+
+
+def test_fill_input_still_types_short_plain_text(monkeypatch):
+    """Short BMP-only text keeps using the keyboard fallback."""
+    engine, driver, element = _failing_js_insert_engine(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        engine._fill_input(driver, element, "hello world")
+
+    typed = [c.args[0] for c in element.send_keys.call_args_list if c.args]
+    assert "hello world" in typed
