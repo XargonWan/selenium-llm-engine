@@ -7,8 +7,8 @@ FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
 # here so it is available inside this build stage for arch-aware COPY below.
 ARG TARGETARCH
 
-# --- Webtop / Selenium environment setup ---
-ENV TITLE="Selenium LLM Engine"
+# --- Webtop / Zen environment setup ---
+ENV TITLE="Zen LLM Engine"
 ENV PIXELFLUX_USE_XSHM=0 \
     PIXELFLUX_DISABLE_XSHM=1 \
     PIXELFLUX_NO_XSHM=1 \
@@ -119,7 +119,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
-ENV SELENIUM_LLM_DB=/app/data/selenium_engine.db
+ENV ZEN_LLM_DB=/app/data/zen_engine.db
 ENV CHROMIUM_HEADLESS=0
 ENV PYTHONUNBUFFERED=1
 

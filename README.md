@@ -1,14 +1,18 @@
-# Selenium LLM Engine
+# Zen LLM Engine
 
-
+> **Zen LLM Engine — A hassle-free Web LLM engine**
+>
 > Disclaimer: this software has been vibe-coded.
+>
+> > [!NOTE]
+> > This project was previously named **selenium-llm-engine**. It has been renamed to **Zen LLM Engine** to better reflect its zendriver-based architecture. For backward compatibility, the Docker image is also published under the old name `xargonwan/selenium-llm-engine:latest` (which will be deprecated in a future release). The legacy `SELENIUM_DEBUG` environment variable still works as an alias for `ZEN_DEBUG`.
 
-![Docker Pulls](https://img.shields.io/docker/pulls/xargonwan/selenium-llm-engine)
+![Docker Pulls](https://img.shields.io/docker/pulls/xargonwan/zen-llm-engine)
 | Branch    | Build Status                                                                                                                                         | Docs Status                                                                                                                                      |
 |-----------|------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
-| `main`    | [![CI Status](https://img.shields.io/github/actions/workflow/status/XargonWan/selenium-llm-engine/build-and-publish.yml)](https://github.com/xargonwan/selenium-llm-engine/actions)
+| `main`    | [![CI Status](https://img.shields.io/github/actions/workflow/status/XargonWan/zen-llm-engine/build-and-publish.yml)](https://github.com/xargonwan/zen-llm-engine/actions)
 
-This repository provides a standalone, Docker-friendly LLM engine proxy. It automates browser access to Web GPTs via [zendriver](https://github.com/stephanlensky/zendriver) (a Chrome DevTools Protocol driver — no Selenium/chromedriver in the loop) to expose a simple OpenAI-compatible API and web admin UI.
+This repository provides a standalone, Docker-friendly LLM engine proxy. It automates browser access to Web LLMs via [zendriver](https://github.com/stephanlensky/zendriver) (a Chrome DevTools Protocol driver — no Selenium/chromedriver in the loop) to expose a simple OpenAI-compatible API and web admin UI.
 
 Feel free to submit pull requests with improvements, new engines, or engine definitions (`engines/*.json` or `engines/*.py`).
 
@@ -51,10 +55,21 @@ Feel free to submit pull requests with improvements, new engines, or engine defi
 
 ## Quickstart
 
-The easiest way to run Selenium LLM Engine is to pull the Docker image from Docker Hub.
+The easiest way to run Zen LLM Engine is to pull the Docker image from Docker Hub.
 
-1. Pull image and run with Docker:
+**New name (recommended):**
+```bash
+docker pull xargonwan/zen-llm-engine:latest
 
+docker run -d --name zen-llm-engine \
+  -p 14848:8000 \
+  -p 3001:3001 \
+  -v data:/app/data \
+  -v config:/config \
+  xargonwan/zen-llm-engine:latest
+```
+
+**Legacy name (for backward compatibility):**
 ```bash
 docker pull xargonwan/selenium-llm-engine:latest
 
@@ -66,13 +81,8 @@ docker run -d --name selenium-llm-engine \
   xargonwan/selenium-llm-engine:latest
 ```
 
-2. Verify service is running:
-
-- `http://localhost:14848/api/ping`
-- `http://localhost:14848/models`
-
 > [!NOTE]
-> Model discovery is dynamic. Although examples use `chatgpt`, `gemini`, `stepfun`, `claude`, the available engines are those present in `engines/` and reported by `/models`.
+> Both image names point to the same image. The legacy `selenium-llm-engine` name is published for backward compatibility and will be deprecated in a future release.
 
 3. OpenAI-compatible endpoints:
 
@@ -138,15 +148,15 @@ prompt lifecycle:
 
 It can be enabled in two ways:
 
-- **Environment variable** at startup — set `SELENIUM_DEBUG` to one of
+- **Environment variable** at startup — set `ZEN_DEBUG` (or legacy `SELENIUM_DEBUG`) to one of
   `1`/`true`/`yes`/`on` (case-insensitive):
 
   ```bash
-  docker run -d --name selenium-llm-engine \
-    -e SELENIUM_DEBUG=true \
+  docker run -d --name zen-llm-engine \
+    -e ZEN_DEBUG=true \
     -p 14848:8000 -p 3001:3001 \
     -v data:/app/data -v config:/config \
-    xargonwan/selenium-llm-engine:latest
+    xargonwan/zen-llm-engine:latest
   ```
 
 - **Web UI / API** at runtime — toggle it from the *Debug Mode* card in `/ui`,
@@ -320,8 +330,8 @@ Example response:
 If you want to build locally from this repository, use Docker Compose:
 
 ```bash
-git clone https://github.com/XargonWan/selenium-llm-engine.git
-cd selenium-llm-engine
+git clone https://github.com/XargonWan/zen-llm-engine.git
+cd zen-llm-engine
 docker compose up --build
 ```
 

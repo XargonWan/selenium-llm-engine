@@ -309,11 +309,11 @@ logging.getLogger().addHandler(_buf_handler)
 # every diagnosis needed `docker logs` and nothing survived a recreate -- the
 # per-step [timing] lines that explain a stuck prompt were simply unavailable
 # to anyone reading a mounted log directory.
-_LOG_DIR = Path(os.getenv("SELENIUM_LOG_DIR", "./logs"))
+_LOG_DIR = Path(os.getenv("ZEN_LOG_DIR", "./logs"))
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _file_handler = RotatingFileHandler(
-        _LOG_DIR / "selenium-llm-engine.log",
+        _LOG_DIR / "zen-llm-engine.log",
         maxBytes=20 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -328,7 +328,7 @@ except OSError as exc:  # pragma: no cover - read-only or absent mount
         "[logging] Cannot write log file in %s: %s", _LOG_DIR, exc
     )
 
-logger = logging.getLogger("selenium-llm-api")
+logger = logging.getLogger("zen-llm-api")
 
 
 # Signal handling for graceful shutdown
@@ -369,7 +369,7 @@ async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
         logger.warning(f"[shutdown] stop_all error: {exc}")
 
 
-app = FastAPI(title="Selenium LLM Engine", version="0.1", lifespan=_lifespan)
+app = FastAPI(title="Zen LLM Engine", version="0.1", lifespan=_lifespan)
 
 # Rate limiting (per ip, sliding window)
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -528,7 +528,7 @@ async def root() -> RedirectResponse:
 
 @app.get("/api/ping", response_model=PingResponse)
 async def ping() -> PingResponse:
-    return PingResponse(status="ok", service="selenium-llm-engine")
+    return PingResponse(status="ok", service="zen-llm-engine")
 
 
 @app.get("/api/engines")
@@ -621,7 +621,7 @@ async def models() -> LegacyModelList:
             "id": engine_name,
             "object": "model",
             "created": created,
-            "owned_by": "selenium-llm-engine",
+"owned_by": "zen-llm-engine",
             # Legacy extra fields (kept for backward compat)
             "name": engine_name,
             "capabilities": _map_media_capabilities_to_model_caps(
@@ -773,7 +773,7 @@ async def v1_model_detail(model_id: str) -> Dict[str, Any]:
         "id": model_id,
         "object": "model",
         "created": int(time.time()),
-        "owned_by": "selenium-llm-engine",
+        "owned_by": "zen-llm-engine",
     }
 
 
@@ -819,7 +819,7 @@ async def openai_chat(req: Request) -> Any:
     unsupported_present = [key for key in unsupported_openai_params if key in data]
     if unsupported_present:
         logger.warning(
-            "[openai_compat] Ignoring unsupported OpenAI parameters for Selenium engines: %s",
+            "[openai_compat] Ignoring unsupported OpenAI parameters for browser engines: %s",
             unsupported_present,
         )
 

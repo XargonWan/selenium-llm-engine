@@ -1,4 +1,4 @@
-# DEVELOPERS.md — Adding New Engines to selenium-llm-engine
+# DEVELOPERS.md — Adding New Engines to Zen LLM Engine
 
 This guide explains how to add a new LLM web interface as an engine.
 Engines are discovered automatically from the `engines/` directory — **no

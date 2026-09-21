@@ -2,7 +2,7 @@
 
 Debug mode is **disabled by default**.  It can be enabled in two ways:
 
-* At startup via the ``SELENIUM_DEBUG`` environment variable
+* At startup via the ``ZEN_DEBUG`` environment variable (or legacy ``SELENIUM_DEBUG``)
   (``1``/``true``/``yes``/``on`` — case-insensitive).
 * At runtime via the Web UI / API (``POST /api/debug``), which overrides the
   environment default until the process restarts.
@@ -16,7 +16,7 @@ When enabled, every prompt lifecycle is traced into an in-memory ring buffer:
 * the total time from input to output.
 
 The buffer is capped so it can never grow without bound.  All operations are
-thread-safe because chunk events are recorded from Selenium worker threads
+thread-safe because chunk events are recorded from browser worker threads
 while HTTP handlers read the buffer from the event loop thread.
 """
 
@@ -40,7 +40,7 @@ _runtime_override: Optional[bool] = None
 
 
 def _env_default() -> bool:
-    raw = os.getenv("SELENIUM_DEBUG", "")
+    raw = os.getenv("ZEN_DEBUG") or os.getenv("SELENIUM_DEBUG", "")
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Selenium LLM Engine Control Panel</title>
+    <title>Zen LLM Engine Control Panel</title>
     <style>
         /* ----------------------------------------------------------------
            CSS custom properties — all colours defined here, never hardcoded
@@ -287,7 +287,7 @@
 </head>
 <body>
     <div class="page-header">
-        <h1>Selenium LLM Engine</h1>
+        <h1>Zen LLM Engine</h1>
         <button id="theme-btn" onclick="cycleTheme()">&#x2299; Auto</button>
     </div>
 
@@ -387,7 +387,7 @@
                 Disabled by default. When on, every prompt lifecycle is traced:
                 input prompt, generated chunks, output reply, target engine and
                 the input&rarr;output time. Can also be enabled at startup via the
-                <code>SELENIUM_DEBUG</code> environment variable.
+                <code>ZEN_DEBUG</code> environment variable.
             </p>
             <div class="filter-row">
                 <label style="display:flex; align-items:center; gap:6px; white-space:nowrap;">
@@ -488,7 +488,7 @@
             try {
                 var data = await fetchJson('/api/engines/default');
                 _defaultEngine = data.default_engine || null;
-                localStorage.setItem('selenium_llm_default_engine', _defaultEngine || '');
+                localStorage.setItem('zen_llm_default_engine', _defaultEngine || '');
             } catch (_) {
                 _defaultEngine = localStorage.getItem('selenium_llm_default_engine') || null;
                 if (_defaultEngine === '') _defaultEngine = null;

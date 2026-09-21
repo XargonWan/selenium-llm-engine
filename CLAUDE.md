@@ -230,7 +230,7 @@ container itself.
 - `GET /api/debug/page-html?engine_name={engine}` — live DOM of that engine's
   browser session (or use the MCP server's `get_page_html`).
 - `GET /api/logs/app?since=N` — incremental app log tail (in-memory ring
-  buffer) — also persisted to `/app/logs/selenium-llm-engine.log` inside the
+  buffer) — also persisted to `/app/logs/zen-llm-engine.log` inside the
   container when writable.
 - The container's noVNC port (see `docker-compose.yml`) shows the actual
   browser live — useful to complete a login manually or see what a selector
