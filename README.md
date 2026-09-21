@@ -1,5 +1,9 @@
 # Zen LLM Engine
 
+<p align="center">
+  <img src="web/zen-llm-engine-logo.png" alt="Zen LLM Engine Logo" width="250">
+</p>
+
 **Zen LLM Engine — A hassle-free Web LLM engine**
 > Disclaimer: this software has been vibe-coded.
 
