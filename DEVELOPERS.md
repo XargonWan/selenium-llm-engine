@@ -1,4 +1,4 @@
-# DEVELOPERS.md — Adding New Engines to selenium-llm-engine
+# DEVELOPERS.md — Adding New Engines to Zen LLM Engine
 
 This guide explains how to add a new LLM web interface as an engine.
 Engines are discovered automatically from the `engines/` directory — **no
@@ -174,7 +174,7 @@ Use this when the site needs custom logic.
 ### Required class attributes
 
 ```python
-class MyEngine(SeleniumLLMBase):
+class MyEngine(ZendriverLLMBase):
     ENGINE_NAME         = "my_engine"        # unique ID
     ENGINE_ALIASES      = ["my_engine"]      # alternate names
     ENGINE_DISPLAY_NAME = "My Engine"        # UI label

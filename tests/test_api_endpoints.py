@@ -3,24 +3,64 @@ import asyncio
 import json
 import threading
 import time
-import types
-import sys
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 import pytest
-from selenium.common.exceptions import TimeoutException
-
-# Some environments may not have distutils installed for undetected_chromedriver.
-# Use a minimal fake module so unit tests can import core modules safely.
-if "undetected_chromedriver" not in sys.modules:
-    sys.modules["undetected_chromedriver"] = types.SimpleNamespace(
-        Chrome=lambda *args, **kwargs: None
-    )
 
 import app as app_module
 from app import app, _register_engine_routes
 from core.engine_manager import EngineManager
 
 client = TestClient(app)
+
+
+def make_tab(**overrides):
+    """A MagicMock standing in for a zendriver ``Tab``.
+
+    All the async entry points ``ZendriverLLMBase`` calls on a Tab are
+    pre-wired as ``AsyncMock`` so ``await tab.method(...)`` works out of the
+    box; override any of them (or add attrs) via keyword arguments.
+    """
+    tab = MagicMock()
+    tab.query_selector_all = AsyncMock(return_value=[])
+    tab.xpath = AsyncMock(return_value=[])
+    tab.get = AsyncMock(return_value=None)
+    tab.evaluate = AsyncMock(return_value="")
+    tab.reload = AsyncMock(return_value=None)
+    tab.wait_for_ready_state = AsyncMock(return_value=True)
+    tab.get_content = AsyncMock(return_value="")
+    tab.url = "https://example.com"
+    for key, value in overrides.items():
+        setattr(tab, key, value)
+    return tab
+
+
+def make_element(*, displayed=True, enabled=True, tag="div", attrs=None, apply_result="", html=""):
+    """A MagicMock standing in for a zendriver ``Element``.
+
+    ``apply_result`` seeds ``element.apply(...)`` (used by the engine for
+    innerText/textContent reads and arbitrary JS) — pass a callable to react
+    to the JS source, or a plain value to always return it.
+    """
+    el = MagicMock()
+    el.tag_name = tag
+    attrs = dict(attrs or {})
+    if not enabled:
+        attrs.setdefault("disabled", "true")
+    el.attrs = attrs
+    position = MagicMock() if displayed else None
+    el.get_position = AsyncMock(return_value=position)
+    el.click = AsyncMock(return_value=None)
+    if callable(apply_result) and not isinstance(apply_result, MagicMock):
+        el.apply = AsyncMock(side_effect=apply_result)
+    else:
+        el.apply = AsyncMock(return_value=apply_result)
+    el.send_keys = AsyncMock(return_value=None)
+    el.send_file = AsyncMock(return_value=None)
+    el.clear_input = AsyncMock(return_value=None)
+    el.scroll_into_view = AsyncMock(return_value=None)
+    el.get_html = AsyncMock(return_value=html)
+    return el
 
 
 class DummyEngine:
@@ -423,9 +463,9 @@ def test_unlogged_flag_behavior():
 
 
 def test_media_limits_fallback_without_config():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -439,9 +479,9 @@ def test_is_same_site_treats_in_site_navigation_as_not_a_redirect():
     path on the SAME host (e.g. '/c' -> '/chat/<id>'). That must not be flagged
     as a redirect-stall. Only a navigation to a DIFFERENT host is a real stall.
     """
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com/c",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -461,9 +501,9 @@ def test_offsite_redirect_stall_is_distinguished_from_generic_stall():
     loop can fail fast, while a generic redirect-stall must NOT be treated as
     off-site (it may be transient and worth retrying).
     """
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com/c",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -483,12 +523,12 @@ def test_offsite_redirect_stall_is_distinguished_from_generic_stall():
 
 
 def test_stepfun_audio_not_supported_by_model():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
     with open("engines/stepfun.json", encoding="utf-8") as fh:
         cfg = json.load(fh)
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url=cfg["service_url"],
         model_limits_map=cfg["models"],
         default_model=cfg.get("default_model", "default"),
@@ -499,9 +539,9 @@ def test_stepfun_audio_not_supported_by_model():
 
 
 def test_media_with_model_not_listed_is_allowed_to_try():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000, "other": 1000},
         default_model="other",
@@ -517,9 +557,9 @@ def test_media_with_model_not_listed_is_allowed_to_try():
 
 
 def test_supported_models_all_allows_every_model():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000, "other": 1000},
         default_model="other",
@@ -535,9 +575,9 @@ def test_supported_models_all_allows_every_model():
 
 
 def test_supported_models_not_unlogged_allows_logged_models():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000, "unlogged": 1000},
         default_model="default",
@@ -553,103 +593,94 @@ def test_supported_models_not_unlogged_allows_logged_models():
 
 
 def test_upload_via_file_input_rejects_missing_value():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    """Pre-existing failure (unrelated to the zendriver migration): the real
+    ``_upload_via_file_input`` trusts a successful send (``send_ok``) even
+    when the 2s post-send poll never observes a value/files count, so with a
+    mock ``send_file`` that raises nothing this returns True, not False. That
+    mismatch between this test's expectation and the implementation predates
+    this port (see CLAUDE.md/AGENTS.md task history) — kept as-is, still
+    failing for the same underlying reason, not a new regression."""
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.media_config = {"audio": {"upload_selectors": ["input[type='file']"]}}
-    mock_driver = MagicMock()
-    mock_input = MagicMock()
-    mock_input.tag_name = "input"
-    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
-    mock_driver.find_elements.return_value = [mock_input]
-    mock_driver.execute_script.return_value = 0
+    mock_input = make_element(tag="input", attrs={"type": "file"}, apply_result=0)
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[mock_input]))
 
-    result = engine._upload_via_file_input(
+    result = asyncio.run(engine._upload_via_file_input(
         type("M", (), {"media_type": "audio"})(),
         "/tmp/dummy.mp3",
-        mock_driver,
-    )
+        tab,
+    ))
     assert result is False
 
 
 def test_upload_via_file_input_accepts_file_list():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.media_config = {"audio": {"upload_selectors": ["input[type='file']"]}}
-    mock_driver = MagicMock()
-    mock_input = MagicMock()
-    mock_input.tag_name = "input"
-    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
-    mock_driver.find_elements.return_value = [mock_input]
-    mock_driver.execute_script.return_value = 1
+    mock_input = make_element(tag="input", attrs={"type": "file"}, apply_result=1)
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[mock_input]))
 
-    result = engine._upload_via_file_input(
+    result = asyncio.run(engine._upload_via_file_input(
         type("M", (), {"media_type": "audio"})(),
         "/tmp/dummy.mp3",
-        mock_driver,
-    )
+        tab,
+    ))
     assert result is True
 
 
 def test_upload_via_file_input_trusts_send_keys_when_spa_clears_files():
-    """Regression: Angular/SPA resets .files/.value after processing; send_keys success should be trusted."""
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    """Regression: Angular/SPA resets .files/.value after processing; send_file success should be trusted."""
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
 
-    mock_driver = MagicMock()
-    mock_input = MagicMock()
-    mock_input.tag_name = "input"
-    # type check returns "file"; value (empty, simulating SPA reset)
-    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
-    mock_input.send_keys.return_value = None  # succeeds without exception
-    mock_driver.find_elements.return_value = [mock_input]
-    # files.length always returns 0 (SPA already cleared the FileList)
-    mock_driver.execute_script.return_value = 0
+    # type check "file"; apply() (files.length) always 0 (SPA already cleared
+    # the FileList) but send_file() succeeds without raising.
+    mock_input = make_element(tag="input", attrs={"type": "file"}, apply_result=0)
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[mock_input]))
 
-    result = engine._upload_via_file_input(
+    result = asyncio.run(engine._upload_via_file_input(
         type("M", (), {"media_type": "image"})(),
         "/tmp/dummy.png",
-        mock_driver,
-    )
+        tab,
+    ))
 
-    assert result is True, "Should trust send_keys success even when SPA clears .files"
+    assert result is True, "Should trust send_file success even when SPA clears .files"
 
 
 def test_upload_via_clipboard_uses_popen_for_xclip():
     """Regression: xclip -i blocks until clipboard is read; must use Popen, not run."""
     import os
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock, patch
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from unittest.mock import patch
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.prompt_area_selectors = ["textarea"]
 
-    mock_driver = MagicMock()
-    mock_input_el = MagicMock()
-    engine._find_interactable_element = MagicMock(return_value=mock_input_el)
+    tab = make_tab()
+    mock_input_el = make_element()
+    engine._find_interactable_element = AsyncMock(return_value=mock_input_el)
 
     mock_proc = MagicMock()
     item = type("M", (), {"media_type": "image", "mime_type": "image/png"})()
@@ -662,134 +693,127 @@ def test_upload_via_clipboard_uses_popen_for_xclip():
         with patch("shutil.which", side_effect=lambda cmd: cmd if cmd == "xclip" else None), \
              patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
              patch("subprocess.run") as mock_run:
-            result = engine._upload_via_clipboard(item, tmp.path if hasattr(tmp, "path") else tmp.name, mock_driver)
+            result = asyncio.run(engine._upload_via_clipboard(item, tmp.name, tab))
         assert result is True
         # Popen must be called (non-blocking); subprocess.run must NOT be called for xclip
         mock_popen.assert_called_once()
         mock_run.assert_not_called()
         # xclip process must be terminated after paste
         mock_proc.terminate.assert_called_once()
+        # Paste is delivered as a real Ctrl+V CDP key combo, not a JS value write.
+        assert mock_input_el.send_keys.called
     finally:
         os.unlink(tmp.name)
 
 
 def test_upload_via_file_input_attempts_visibility_fallback_for_hidden_inputs():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
 
-    mock_driver = MagicMock()
-    mock_input = MagicMock()
-    mock_input.tag_name = "input"
-    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
-    mock_input.send_keys.side_effect = [Exception("element not interactable"), None]
-    mock_driver.find_elements.return_value = [mock_input]
-    mock_driver.execute_script.return_value = 1
+    mock_input = make_element(tag="input", attrs={"type": "file"}, apply_result=1)
+    mock_input.send_file = AsyncMock(side_effect=[Exception("element not interactable"), None])
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[mock_input]))
 
-    result = engine._upload_via_file_input(
+    result = asyncio.run(engine._upload_via_file_input(
         type("M", (), {"media_type": "image"})(),
         "/tmp/dummy.png",
-        mock_driver,
-    )
+        tab,
+    ))
 
     assert result is True
-    assert mock_driver.execute_script.called
+    # The visibility-forcing JS ran as part of the send_file retry fallback.
+    assert mock_input.apply.called
 
 
 def test_upload_media_returns_false_when_all_upload_paths_fail():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.media_config = {"audio": {"upload_selectors": ["input[type='file']"]}}
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = []
+    tab = make_tab()  # query_selector_all() -> [] for every selector
 
-    result = engine._upload_media(
+    result = asyncio.run(engine._upload_media(
         [type("M", (), {"media_type": "audio", "mime_type": "audio/mpeg", "data": b"dummy"})()],
-        mock_driver,
-    )
+        tab,
+    ))
     assert result is False
 
 
 def test_upload_media_clicks_accept_buttons_after_successful_upload():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.media_config = {"image": {"upload_selectors": ["input[type='file']"]}}
 
-    mock_driver = MagicMock()
-    mock_input = MagicMock()
-    mock_input.tag_name = "input"
-    mock_input.get_attribute.side_effect = lambda attr: "file" if attr == "type" else ""
-    mock_input.send_keys.return_value = None
-    mock_driver.find_elements.side_effect = (
-        lambda by, sel: [mock_input] if sel == "input[type='file']" else []
-    )
-    engine._click_accept_buttons = MagicMock()
+    mock_input = make_element(tag="input", attrs={"type": "file"}, apply_result=1)
 
-    result = engine._upload_media(
+    async def _query_side_effect(sel):
+        return [mock_input] if sel == "input[type='file']" else []
+
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=_query_side_effect))
+    engine._click_accept_buttons = AsyncMock()
+
+    result = asyncio.run(engine._upload_media(
         [type("M", (), {"media_type": "image", "mime_type": "image/png", "data": b"dummy"})()],
-        mock_driver,
-    )
+        tab,
+    ))
 
     assert result is True
-    engine._click_accept_buttons.assert_called_once_with(mock_driver, timeout=5.0)
+    engine._click_accept_buttons.assert_called_once_with(tab, timeout=5.0)
 
 
 def test_sync_generate_response_once_returns_error_when_send_button_not_ready_after_media_upload():
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    engine.driver = MagicMock()
+    engine.driver = make_tab()
     engine.service_url = "https://example.com"
-    engine._ensure_ready = lambda: None
-    engine.is_user_logged_in = lambda: True
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
-    engine._check_account_tier = lambda driver: "base"
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.refresh_login_state = AsyncMock(return_value=True)
+    engine._click_accept_buttons = AsyncMock(return_value=None)
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
+    engine._check_account_tier = AsyncMock(return_value="base")
     engine._check_media_limits = lambda media, tier: None
-    engine._upload_media = lambda media, driver: True
-    engine._find_interactable_element = lambda driver, selectors, timeout, cache_attr=None: MagicMock()
-    engine._fill_input = lambda driver, element, text: None
-    engine._wait_for_send_button_after_media_upload = lambda driver: False
-    engine._click_send = lambda driver, element: None
-    engine._post_send_check = lambda driver: True
-    engine._wait_for_response = lambda driver: "response"
+    engine._upload_media = AsyncMock(return_value=True)
+    engine._find_interactable_element = AsyncMock(return_value=make_element())
+    engine._fill_input = AsyncMock(return_value=None)
+    engine._wait_for_send_button_after_media_upload = AsyncMock(return_value=False)
+    engine._click_send = AsyncMock(return_value=None)
+    engine._post_send_check = AsyncMock(return_value=True)
+    engine._wait_for_response = AsyncMock(return_value="response")
 
-    result = engine._sync_generate_response_once("Hello", [type(
+    result = asyncio.run(engine._generate_response_once("Hello", [type(
         "M", (), {"media_type": "audio", "mime_type": "audio/mpeg", "data": b"dummy"}
-    )()])
+    )()]))
     assert result == "⚠️ Media upload failed. Please verify the file and try again."
 
 
 def test_total_media_limit_applies_across_types():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -885,8 +909,46 @@ def test_api_reset_alias():
     response = client.post("/api/reset")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_reset_session_clears_engines_but_not_stats_or_history(monkeypatch):
+    """/api/session/reset clears engine/browser/queue state (same as /reset)
+    but must NOT wipe stats or prompt history -- that's what distinguishes it
+    from /reset, so it's safe to use as a "something's stuck" unblock without
+    losing history. Also must not SIGKILL: stop_all() is the graceful path
+    (see EngineManager.stop_all / shutdown_shared_driver), unlike
+    /api/session/kill's force_kill_session()."""
+    manager = EngineManager.get()
+    manager.active_engine = manager.engines.get("chatgpt")
+
+    stop_all_calls = []
+
+    async def fake_stop_all():
+        stop_all_calls.append(1)
+
+    monkeypatch.setattr(manager, "stop_all", fake_stop_all)
+    # drain_queues() itself is exercised by test_reset_state/test_api_reset_alias
+    # already; stub it here so this test stays focused on (and immune to
+    # ordering effects on) the stats/history/graceful-stop distinction it's
+    # actually about.
+    monkeypatch.setattr(manager, "drain_queues", AsyncMock())
+
+    stats_cleared = []
+    history_cleared = []
+    monkeypatch.setattr("app.clear_stats", lambda: stats_cleared.append(1))
+    monkeypatch.setattr("app.clear_prompt_logs", lambda: history_cleared.append(1))
+
+    response = client.post("/api/session/reset")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert "preserved" in body["message"].lower()
+
     assert manager.engines == {}
     assert manager.active_engine is None
+    assert stop_all_calls == [1]  # graceful stop_all(), not force_kill_session()
+    assert stats_cleared == []
+    assert history_cleared == []
 
 
 def test_reset_cancels_inflight_requests():
@@ -961,25 +1023,26 @@ def test_api_history_endpoint():
 
 
 def test_captcha_detection_short_circuit(monkeypatch):
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    class FakeCaptchaDriver:
-        current_url = "https://chat.openai.com"
-
-        def find_elements(self, by, selector):
-            if selector == "iframe#cf-chl-widget-ezspn":
-                return [object()]
-            return []
-
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://chat.openai.com",
         model_limits_map={"default": 50000},
         default_model="default",
     )
-    engine._ensure_ready = lambda: None
-    engine.driver = FakeCaptchaDriver()
 
-    result = engine._sync_generate_response_once("Hello")
+    async def _query_side_effect(sel):
+        return [make_element()] if sel == "iframe#cf-chl-widget-ezspn" else []
+
+    engine.driver = make_tab(
+        query_selector_all=AsyncMock(side_effect=_query_side_effect),
+        url="https://chat.openai.com",
+    )
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.refresh_login_state = AsyncMock(return_value=True)
+    engine._click_accept_buttons = AsyncMock(return_value=None)
+
+    result = asyncio.run(engine._generate_response_once("Hello"))
     assert "CAPTCHA" in result or "captcha" in result
     assert "Please complete" in result
 
@@ -1026,7 +1089,6 @@ def test_gemini_login_detection_flags_signed_out_state_correctly():
     "Sign in" link -- must be detected as logged out, not fall through to
     the "assume logged in" default."""
     from pathlib import Path
-    from unittest.mock import MagicMock
 
     from core.json_engine import JsonEngine
 
@@ -1034,19 +1096,14 @@ def test_gemini_login_detection_flags_signed_out_state_correctly():
     engine = JsonEngine(engines_dir / "gemini.json")
     login_xpath = engine._login_cfg["login_button_xpath"]
 
-    driver = MagicMock()
-    driver.current_url = "https://gemini.google.com/"
+    async def _xpath_side_effect(xp, timeout=2.5):
+        return [make_element()] if xp == login_xpath else []
 
-    def _find_elements(by, selector):
-        if selector == login_xpath:
-            el = MagicMock()
-            el.is_displayed.return_value = True
-            return [el]
-        return []  # no Google Account button / logout link -- signed out
+    tab = make_tab(url="https://gemini.google.com/", xpath=AsyncMock(side_effect=_xpath_side_effect))
+    # No Google Account button / logout link -- signed out: query_selector_all
+    # (used for authenticated_css_selectors) keeps the default empty result.
 
-    driver.find_elements.side_effect = _find_elements
-
-    assert engine._ensure_logged_in(driver) is False
+    assert asyncio.run(engine._ensure_logged_in(tab)) is False
 
 
 def test_gemini_login_detection_flags_signed_in_state():
@@ -1055,7 +1112,6 @@ def test_gemini_login_detection_flags_signed_in_state():
     SignOutOptions link (not "logout") -- the selectors must match the real
     tag/wording, not a guess."""
     from pathlib import Path
-    from unittest.mock import MagicMock
 
     from core.json_engine import JsonEngine
 
@@ -1063,27 +1119,20 @@ def test_gemini_login_detection_flags_signed_in_state():
     engine = JsonEngine(engines_dir / "gemini.json")
     account_selector = engine._login_cfg["authenticated_css_selectors"][0]
 
-    driver = MagicMock()
-    driver.current_url = "https://gemini.google.com/"
+    async def _query_side_effect(sel):
+        return [make_element()] if sel == account_selector else []
 
-    def _find_elements(by, selector):
-        if selector == account_selector:
-            el = MagicMock()
-            el.is_displayed.return_value = True
-            return [el]
-        return []
+    tab = make_tab(url="https://gemini.google.com/", query_selector_all=AsyncMock(side_effect=_query_side_effect))
 
-    driver.find_elements.side_effect = _find_elements
-
-    assert engine._ensure_logged_in(driver) is True
+    assert asyncio.run(engine._ensure_logged_in(tab)) is True
 
 
 def test_error_indicator_selectors_default_empty():
     """Engines without an ``error_indicators`` key keep an empty list so the
     base engine behaviour is unchanged (engine-agnostic default)."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1092,78 +1141,60 @@ def test_error_indicator_selectors_default_empty():
 
 
 def test_get_error_indicator_text_returns_text_when_present():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    class FakeElement:
-        def __init__(self, text):
-            self._text = text
-
-        @property
-        def text(self):
-            return self._text
-
-        def is_displayed(self):
-            return True
-
-    class FakeDriver:
-        def find_elements(self, by, selector):
-            if selector == "mat-snack-bar-container":
-                return [FakeElement("Something went wrong (1076)")]
-            return []
-
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.error_indicator_selectors = ["mat-snack-bar-container", ".error-message"]
 
-    text = engine._get_error_indicator_text(FakeDriver())
+    async def _query_side_effect(sel):
+        if sel == "mat-snack-bar-container":
+            return [make_element(apply_result="Something went wrong (1076)")]
+        return []
+
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=_query_side_effect))
+
+    text = asyncio.run(engine._get_error_indicator_text(tab))
     assert text == "Something went wrong (1076)"
 
 
 def test_get_error_indicator_text_none_when_not_configured():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    class FakeDriver:
-        def find_elements(self, by, selector):
-            raise AssertionError("find_elements must not be called when unconfigured")
+    def _fail(sel):
+        raise AssertionError("query_selector_all must not be called when unconfigured")
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=_fail))
     # Default empty list -> no lookups, returns None.
-    assert engine._get_error_indicator_text(FakeDriver()) is None
+    assert asyncio.run(engine._get_error_indicator_text(tab)) is None
 
 
 def test_get_error_indicator_text_none_when_hidden():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    class HiddenElement:
-        text = "Something went wrong (1076)"
-
-        def is_displayed(self):
-            return False
-
-    class FakeDriver:
-        def find_elements(self, by, selector):
-            return [HiddenElement()]
-
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     engine.error_indicator_selectors = ["mat-snack-bar-container"]
-    assert engine._get_error_indicator_text(FakeDriver()) is None
+    hidden = make_element(displayed=False, apply_result="Something went wrong (1076)")
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[hidden]))
+    assert asyncio.run(engine._get_error_indicator_text(tab)) is None
 
 
 def test_is_engine_error_response_detects_something_went_wrong():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1174,9 +1205,9 @@ def test_is_engine_error_response_detects_something_went_wrong():
 
 
 def test_is_engine_error_response_ignores_normal_reply_with_number():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1187,9 +1218,9 @@ def test_is_engine_error_response_ignores_normal_reply_with_number():
 
 
 def test_check_login_state_no_browser_launch_when_uninitialized():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://chat.openai.com",
         model_limits_map={"default": 50000},
         default_model="default",
@@ -1198,7 +1229,7 @@ def test_check_login_state_no_browser_launch_when_uninitialized():
     # If check_login_state is called before initialization, it must not cause browser init
     called = False
 
-    def fail_init():
+    async def fail_init():
         nonlocal called
         called = True
         raise RuntimeError("_ensure_ready should not be called")
@@ -1249,124 +1280,81 @@ def test_v1_models_variant():
 
 
 def test_fill_input_contenteditable_triggers_extra_keystroke():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from selenium.webdriver.common.keys import Keys
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from zendriver.core.keys import SpecialKeys
 
-    events = []
-
-    class FakeElement:
-        tag_name = "div"
-
-        def click(self):
-            events.append("click")
-
-        def send_keys(self, *args):
-            events.append(("send_keys", args))
-
-    class FakeDriver:
-        def __init__(self):
-            self.script_calls = []
-
-        def execute_script(self, script, *args):
-            self.script_calls.append((script, args))
-            if "document.execCommand('insertText'" in script:
-                return None
-            if "const text = el.innerText" in script:
-                return "test"
+    async def apply_side_effect(js):
+        if "document.execCommand('insertText'" in js:
             return None
+        if "el.innerText || el.textContent" in js:
+            return "test"
+        return None
 
-    engine = SeleniumLLMBase(
+    fake_el = make_element(tag="div", apply_result=apply_side_effect)
+    tab = make_tab()
+
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
-    engine._ensure_ready = lambda: None
-    engine.driver = FakeDriver()
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.driver = tab
 
-    fake_el = FakeElement()
-    engine._fill_input(engine.driver, fake_el, "test")
+    asyncio.run(engine._fill_input(tab, fake_el, "test"))
 
     assert any(
-        "document.execCommand('insertText'" in call[0] for call in engine.driver.script_calls
+        "document.execCommand('insertText'" in call.args[0] for call in fake_el.apply.await_args_list
     )
-    assert ("send_keys", (Keys.SPACE, Keys.BACKSPACE)) in events
+    send_keys_args = [call.args[0] for call in fake_el.send_keys.await_args_list]
+    assert SpecialKeys.SPACE in send_keys_args
+    assert SpecialKeys.BACKSPACE in send_keys_args
 
 
 def test_fill_input_verifies_input_value_for_textarea():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    class FakeElement:
-        tag_name = "textarea"
+    async def apply_side_effect(js):
+        if "el.innerText || el.textContent" in js:
+            return "hello world"
+        return None
 
-        def __init__(self):
-            self.value = ""
+    fake_el = make_element(tag="textarea", apply_result=apply_side_effect)
+    tab = make_tab()
 
-        def click(self):
-            pass
-
-        def clear(self):
-            self.value = ""
-
-        def send_keys(self, text):
-            self.value = text
-
-        def get_attribute(self, name):
-            if name == "value":
-                return self.value
-            return None
-
-    class FakeDriver:
-        def execute_script(self, script, *args):
-            return None
-
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
-    engine._ensure_ready = lambda: None
-    engine.driver = FakeDriver()
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.driver = tab
 
-    fake_el = FakeElement()
-    engine._fill_input(engine.driver, fake_el, "hello world")
-    assert fake_el.get_attribute("value") == "hello world"
+    asyncio.run(engine._fill_input(tab, fake_el, "hello world"))
+    assert fake_el.send_keys.await_args_list[-1].args[0] == "hello world"
 
 
 def test_fill_input_raises_when_verification_fails():
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    class FakeElement:
-        tag_name = "textarea"
+    async def apply_side_effect(js):
+        if "el.innerText || el.textContent" in js:
+            return "wrong text"
+        return None
 
-        def click(self):
-            pass
+    fake_el = make_element(tag="textarea", apply_result=apply_side_effect)
+    tab = make_tab()
 
-        def clear(self):
-            pass
-
-        def send_keys(self, text):
-            pass
-
-        def get_attribute(self, name):
-            if name == "value":
-                return "wrong text"
-            return None
-
-    class FakeDriver:
-        def execute_script(self, script, *args):
-            return None
-
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://www.example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
-    engine._ensure_ready = lambda: None
-    engine.driver = FakeDriver()
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.driver = tab
 
-    fake_el = FakeElement()
     with pytest.raises(RuntimeError, match="fill_input verification failed"):
-        engine._fill_input(engine.driver, fake_el, "hello world")
+        asyncio.run(engine._fill_input(tab, fake_el, "hello world"))
 
 
 def test_v1_models_unknown():
@@ -1534,59 +1522,36 @@ def test_selector_hints_reflect_cached_values():
 
 def test_find_interactable_element_caches_selector():
     """_find_interactable_element sets cache_attr to the found selector."""
-    try:
-        from core.selenium_llm_base import SeleniumLLMBase
-    except ModuleNotFoundError:
-        pytest.skip("undetected_chromedriver not compatible with this Python version")
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    from unittest.mock import MagicMock, patch
-
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     assert base._cached_prompt_selector is None
 
-    mock_driver = MagicMock()
-    fake_el = MagicMock()
-
     winning_selector = "div[contenteditable='true']"
+    fake_el = make_element()
 
-    def fake_wait_until(condition):
-        # Simulate: first selector times out, second succeeds
-        sel = condition.locator[1]
-        if sel == winning_selector:
-            return fake_el
-        from selenium.common.exceptions import TimeoutException
-        raise TimeoutException()
+    async def query_side_effect(sel):
+        return [fake_el] if sel == winning_selector else []
 
-    mock_wait = MagicMock()
-    mock_wait.until.side_effect = fake_wait_until
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect))
+    selectors = ["textarea", winning_selector]
+    result = asyncio.run(base._find_interactable_element(
+        tab, selectors, timeout=3.0, cache_attr="_cached_prompt_selector"
+    ))
 
-    def make_wait(driver, timeout):
-        return mock_wait
-
-    with patch("core.selenium_llm_base.WebDriverWait", side_effect=make_wait):
-        selectors = ["textarea", winning_selector]
-        result = base._find_interactable_element(
-            mock_driver, selectors, timeout=3.0, cache_attr="_cached_prompt_selector"
-        )
-
-    assert result == fake_el
+    assert result is fake_el
     assert base._cached_prompt_selector == winning_selector
 
 
 def test_find_interactable_element_tries_cached_first():
     """When a cached selector exists it is tried before others."""
-    try:
-        from core.selenium_llm_base import SeleniumLLMBase
-    except ModuleNotFoundError:
-        pytest.skip("undetected_chromedriver not compatible with this Python version")
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    from unittest.mock import MagicMock, patch
-
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1595,128 +1560,83 @@ def test_find_interactable_element_tries_cached_first():
     base._cached_prompt_selector = cached_sel
 
     tried_order: list[str] = []
-    fake_el = MagicMock()
+    fake_el = make_element()
 
-    def fake_wait_until(condition):
-        sel = condition.locator[1]
+    async def query_side_effect(sel):
         tried_order.append(sel)
-        if sel == cached_sel:
-            return fake_el
-        from selenium.common.exceptions import TimeoutException
-        raise TimeoutException()
+        return [fake_el] if sel == cached_sel else []
 
-    mock_wait = MagicMock()
-    mock_wait.until.side_effect = fake_wait_until
-
-    with patch("core.selenium_llm_base.WebDriverWait", return_value=mock_wait):
-        selectors = ["textarea", cached_sel, "input"]
-        base._find_interactable_element(
-            MagicMock(), selectors, timeout=3.0, cache_attr="_cached_prompt_selector"
-        )
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect))
+    selectors = ["textarea", cached_sel, "input"]
+    asyncio.run(base._find_interactable_element(
+        tab, selectors, timeout=3.0, cache_attr="_cached_prompt_selector"
+    ))
 
     assert tried_order[0] == cached_sel, "Cached selector must be tried first"
 
 
 def test_find_interactable_element_falls_back_to_visible_non_clickable_element():
-    try:
-        from core.selenium_llm_base import SeleniumLLMBase
-    except ModuleNotFoundError:
-        pytest.skip("undetected_chromedriver not compatible with this Python version")
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    from unittest.mock import MagicMock, patch
-    from selenium.common.exceptions import TimeoutException
-
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
 
-    mock_driver = MagicMock()
-    visible_element = MagicMock()
-    visible_element.is_displayed.return_value = True
+    # Visible but disabled: never satisfies the "clickable" main loop, only
+    # the final visible-only fallback pass.
+    visible_element = make_element(displayed=True, enabled=False)
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[visible_element]))
 
-    def fake_wait_until(condition):
-        raise TimeoutException()
+    result = asyncio.run(base._find_interactable_element(
+        tab,
+        ["div[contenteditable='true']"],
+        timeout=0.5,
+        cache_attr="_cached_prompt_selector",
+    ))
 
-    mock_wait = MagicMock()
-    mock_wait.until.side_effect = fake_wait_until
-
-    with patch("core.selenium_llm_base.WebDriverWait", return_value=mock_wait):
-        mock_driver.find_elements.return_value = [visible_element]
-        result = base._find_interactable_element(
-            mock_driver,
-            ["div[contenteditable='true']"],
-            timeout=2.0,
-            cache_attr="_cached_prompt_selector",
-        )
-
-    assert result == visible_element
+    assert result is visible_element
     assert base._cached_prompt_selector == "div[contenteditable='true']"
 
 
 def test_find_interactable_element_handles_stale_cached_selector():
-    """If cached selector raises StaleElementReferenceException then fallback is used."""
-    try:
-        from core.selenium_llm_base import SeleniumLLMBase
-    except ModuleNotFoundError:
-        pytest.skip("undetected_chromedriver not compatible with this Python version")
+    """If the cached selector's query raises, the other selector is still tried."""
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    from selenium.common.exceptions import StaleElementReferenceException
-    from unittest.mock import MagicMock, patch
-
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     base._cached_prompt_selector = "textarea"
 
-    mock_driver = MagicMock()
-    fake_el = MagicMock()
+    fake_el = make_element()
 
-    selectors_calls = iter(["textarea", "div[contenteditable='true']"])
-
-    def fake_wait_until(condition):
-        try:
-            sel = condition.locator[1]
-        except Exception:
-            sel = next(selectors_calls)
-
+    async def query_side_effect(sel):
         if sel == "textarea":
-            raise StaleElementReferenceException("stale")
+            raise Exception("could not find node with given id")
         if sel == "div[contenteditable='true']":
-            return fake_el
-        from selenium.common.exceptions import TimeoutException
+            return [fake_el]
+        return []
 
-        raise TimeoutException()
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect))
+    result = asyncio.run(base._find_interactable_element(
+        tab,
+        ["textarea", "div[contenteditable='true']"],
+        timeout=3.0,
+        cache_attr="_cached_prompt_selector",
+    ))
 
-    mock_wait = MagicMock()
-    mock_wait.until.side_effect = fake_wait_until
-
-    with patch("core.selenium_llm_base.WebDriverWait", return_value=mock_wait):
-        result = base._find_interactable_element(
-            mock_driver,
-            ["textarea", "div[contenteditable='true']"],
-            timeout=3.0,
-            cache_attr="_cached_prompt_selector",
-        )
-
-    assert result == fake_el
+    assert result is fake_el
     assert base._cached_prompt_selector == "div[contenteditable='true']"
 
 
 def test_click_send_handles_stale_first_selector():
-    """If first send selector is stale, next selector should be used and cached."""
-    try:
-        from core.selenium_llm_base import SeleniumLLMBase
-    except ModuleNotFoundError:
-        pytest.skip("undetected_chromedriver not compatible with this Python version")
+    """If first send selector's click fails (stale element), next selector should be used and cached."""
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    from selenium.common.exceptions import StaleElementReferenceException
-    from unittest.mock import MagicMock, patch
-
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1724,141 +1644,97 @@ def test_click_send_handles_stale_first_selector():
     base.send_button_selectors = ["button.send", "button.send2"]
     base._cached_send_selector = "button.send"
 
-    mock_driver = MagicMock()
-    fake_btn = MagicMock()
+    stale_btn = make_element()
+    stale_btn.click = AsyncMock(side_effect=Exception("could not find node with given id"))
+    stale_btn.apply = AsyncMock(side_effect=Exception("could not find node with given id"))
+    good_btn = make_element()
 
-    selectors_calls = iter(["button.send", "button.send2"])
-
-    def fake_wait_until(condition):
-        try:
-            sel = condition.locator[1]
-        except Exception:
-            sel = next(selectors_calls)
-
+    async def query_side_effect(sel):
         if sel == "button.send":
-            raise StaleElementReferenceException("stale")
+            return [stale_btn]
         if sel == "button.send2":
-            return fake_btn
-        from selenium.common.exceptions import TimeoutException
+            return [good_btn]
+        return []
 
-        raise TimeoutException()
-
-    mock_wait = MagicMock()
-    mock_wait.until.side_effect = fake_wait_until
-
-    with patch("core.selenium_llm_base.WebDriverWait", return_value=mock_wait):
-        base._click_send(mock_driver, MagicMock())
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect))
+    asyncio.run(base._click_send(tab, make_element()))
 
     assert base._cached_send_selector == "button.send2"
+    assert good_btn.click.called
 
 
 def test_fill_input_retries_on_stale_element():
     """_fill_input should recover from a stale input element by refinding it."""
-    try:
-        from core.selenium_llm_base import SeleniumLLMBase
-    except ModuleNotFoundError:
-        pytest.skip("undetected_chromedriver not compatible with this Python version")
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    from selenium.common.exceptions import StaleElementReferenceException
-    from unittest.mock import MagicMock
-
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
-    first_input = MagicMock()
-    first_input.tag_name = "textarea"
-    first_input.click.side_effect = StaleElementReferenceException("stale")
-    first_input.clear.side_effect = StaleElementReferenceException("stale")
+    first_input = make_element(tag="textarea")
+    # The final, unguarded send_keys(text) call is where a stale reference
+    # would surface (clear_input()'s own fallback swallows its failures).
+    first_input.send_keys = AsyncMock(side_effect=Exception("could not find node with given id"))
 
-    class FakeTextarea:
-        tag_name = "textarea"
+    async def apply_side_effect(js):
+        if "el.innerText || el.textContent" in js:
+            return "hello world"
+        return None
 
-        def __init__(self):
-            self._value = ""
-            self.clear_called = False
-            self.send_keys_called = False
+    second_input = make_element(tag="textarea", apply_result=apply_side_effect)
+    tab = make_tab()
 
-        def click(self):
-            return None
+    base._find_interactable_element = AsyncMock(return_value=second_input)
 
-        def clear(self):
-            self.clear_called = True
-            self._value = ""
+    asyncio.run(base._fill_input(tab, first_input, "hello world"))
 
-        def send_keys(self, text):
-            self.send_keys_called = True
-            self._value = text
-
-        def get_attribute(self, name):
-            if name == "value":
-                return self._value
-            return None
-
-    second_input = FakeTextarea()
-
-    def find_input(driver, selectors, timeout, cache_attr=None):
-        return second_input
-
-    base._find_interactable_element = find_input
-
-    base._fill_input(MagicMock(), first_input, "hello world")
-
-    assert second_input.clear_called
-    assert second_input.send_keys_called
-    assert second_input._value == "hello world"
+    assert second_input.clear_input.called
+    assert second_input.send_keys.await_args_list[-1].args[0] == "hello world"
 
 
 def test_wait_for_send_button_after_media_upload_returns_true_when_button_appears():
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    mock_driver = MagicMock()
-    fake_button = MagicMock()
-    fake_button.is_displayed.return_value = True
-    fake_button.is_enabled.return_value = True
-    mock_driver.find_elements.side_effect = [[], [fake_button]]
+    fake_button = make_element()
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=[[], [fake_button]]))
 
-    result = base._wait_for_send_button_after_media_upload(mock_driver, timeout=1.0)
+    result = asyncio.run(base._wait_for_send_button_after_media_upload(tab, timeout=1.0))
 
     assert result is True
-    assert mock_driver.find_elements.call_count == 2
+    assert tab.query_selector_all.await_count == 2
 
 
 def test_wait_for_send_button_after_media_upload_times_out_when_button_never_appears():
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = []
+    tab = make_tab()  # query_selector_all() -> [] always
 
-    result = base._wait_for_send_button_after_media_upload(mock_driver, timeout=0.1)
+    result = asyncio.run(base._wait_for_send_button_after_media_upload(tab, timeout=0.1))
 
     assert result is False
 
 
 def test_wait_for_media_upload_complete_waits_for_selector_presence():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1868,26 +1744,23 @@ def test_wait_for_media_upload_complete_waits_for_selector_presence():
             "upload_complete_selectors": ["div.upload-preview"]
         }
     }
-    mock_driver = MagicMock()
-    fake_element = MagicMock()
-    fake_element.is_displayed.return_value = True
-    mock_driver.find_elements.side_effect = [[], [fake_element]]
+    fake_element = make_element()
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=[[], [fake_element]]))
 
-    result = base._wait_for_media_upload_complete(
+    result = asyncio.run(base._wait_for_media_upload_complete(
         type("M", (), {"media_type": "image"})(),
-        mock_driver,
+        tab,
         timeout=1.0,
-    )
+    ))
 
     assert result is True
-    assert mock_driver.find_elements.call_count == 2
+    assert tab.query_selector_all.await_count == 2
 
 
 def test_wait_for_media_upload_complete_waits_for_selector_absence():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -1897,55 +1770,48 @@ def test_wait_for_media_upload_complete_waits_for_selector_absence():
             "upload_complete_selectors": ["!upload-image-disclaimer-dialog"]
         }
     }
-    mock_driver = MagicMock()
-    fake_element = MagicMock()
-    fake_element.is_displayed.return_value = True
-    mock_driver.find_elements.side_effect = [[fake_element], []]
+    fake_element = make_element()
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=[[fake_element], []]))
 
-    result = base._wait_for_media_upload_complete(
+    result = asyncio.run(base._wait_for_media_upload_complete(
         type("M", (), {"media_type": "image"})(),
-        mock_driver,
+        tab,
         timeout=1.0,
-    )
+    ))
 
     assert result is True
-    assert mock_driver.find_elements.call_count == 2
+    assert tab.query_selector_all.await_count == 2
 
 
 def test_is_limit_present_detects_limit_warning():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     base.limit_selectors = ["div.limit-warning"]
 
-    fake_element = MagicMock()
-    fake_element.is_displayed.return_value = True
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = [fake_element]
+    fake_element = make_element()
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[fake_element]))
 
-    assert base._is_limit_present(mock_driver) is True
+    assert asyncio.run(base._is_limit_present(tab)) is True
 
 
 def test_is_limit_present_returns_false_when_no_limit_warning():
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    base = SeleniumLLMBase(
+    base = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
     )
     base.limit_selectors = ["div.limit-warning"]
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = []
+    tab = make_tab()  # query_selector_all() -> [] always
 
-    assert base._is_limit_present(mock_driver) is False
+    assert asyncio.run(base._is_limit_present(tab)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -2093,10 +1959,9 @@ def test_legacy_models_response_schema_fields():
 def test_post_send_check_returns_true_when_stop_button_visible():
     """_post_send_check must return True immediately when a stop button becomes visible."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2104,24 +1969,19 @@ def test_post_send_check_returns_true_when_stop_button_visible():
     )
     engine.stop_selectors = ["button[aria-label*='Stop']"]
 
-    fake_btn = MagicMock()
-    fake_btn.is_displayed.return_value = True
+    fake_btn = make_element()
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[fake_btn]), url="https://example.com")
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = [fake_btn]
-    mock_driver.current_url = "https://example.com"
-
-    result = engine._post_send_check(mock_driver, timeout=2.0)
+    result = asyncio.run(engine._post_send_check(tab, timeout=2.0))
     assert result is True
 
 
 def test_post_send_check_recognizes_mat_icon_stop_selector():
     """_post_send_check must detect a material icon stop indicator."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2129,14 +1989,10 @@ def test_post_send_check_recognizes_mat_icon_stop_selector():
     )
     engine.stop_selectors = ["mat-icon[fonticon='stop']"]
 
-    fake_icon = MagicMock()
-    fake_icon.is_displayed.return_value = True
+    fake_icon = make_element()
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[fake_icon]), url="https://example.com")
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = [fake_icon]
-    mock_driver.current_url = "https://example.com"
-
-    result = engine._post_send_check(mock_driver, timeout=2.0)
+    result = asyncio.run(engine._post_send_check(tab, timeout=2.0))
     assert result is True
 
 
@@ -2144,10 +2000,9 @@ def test_post_send_check_returns_false_on_redirect():
     """_post_send_check must return False when timeout expires and URL has changed."""
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2156,12 +2011,10 @@ def test_post_send_check_returns_false_on_redirect():
     engine.stop_selectors = ["button[aria-label*='Stop']"]
     engine.response_area_selectors = [".assistant-message"]
 
-    mock_driver = MagicMock()
     # No stop button, no response text
-    mock_driver.find_elements.return_value = []
-    mock_driver.current_url = "https://auth.example.com/login"
+    tab = make_tab(url="https://auth.example.com/login")
 
-    result = engine._post_send_check(mock_driver, timeout=0.1)
+    result = asyncio.run(engine._post_send_check(tab, timeout=0.1))
     assert result is False
 
 
@@ -2169,10 +2022,9 @@ def test_get_latest_response_text_uses_first_matching_selector():
     """_get_latest_response_text should return text from the first selector that matches."""
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2180,19 +2032,16 @@ def test_get_latest_response_text_uses_first_matching_selector():
     )
     engine.response_area_selectors = ["div.assistant", "div.alternate"]
 
-    def find_elements(by, value):
-        if value == "div.assistant":
+    async def query_side_effect(sel):
+        if sel == "div.assistant":
             return []
-        if value == "div.alternate":
-            el = MagicMock()
-            el.text = "Hello from assistant"
-            return [el]
+        if sel == "div.alternate":
+            return [make_element(apply_result="Hello from assistant")]
         return []
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.side_effect = find_elements
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect))
 
-    result = engine._get_latest_response_text(mock_driver)
+    result = asyncio.run(engine._get_latest_response_text(tab))
     assert result == "Hello from assistant"
 
 
@@ -2200,10 +2049,9 @@ def test_get_latest_response_text_checks_prior_elements_when_last_is_empty():
     """_get_latest_response_text should use an earlier matching element when the last one is blank."""
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2211,18 +2059,12 @@ def test_get_latest_response_text_checks_prior_elements_when_last_is_empty():
     )
     engine.response_area_selectors = ["div.assistant"]
 
-    empty_elem = MagicMock()
-    empty_elem.text = ""
-    empty_elem.get_attribute.return_value = ""
+    empty_elem = make_element(apply_result="")
+    filled_elem = make_element(apply_result="OK")
 
-    filled_elem = MagicMock()
-    filled_elem.text = "OK"
-    filled_elem.get_attribute.return_value = "OK"
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[filled_elem, empty_elem]))
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = [filled_elem, empty_elem]
-
-    result = engine._get_latest_response_text(mock_driver)
+    result = asyncio.run(engine._get_latest_response_text(tab))
     assert result == "OK"
 
 
@@ -2230,10 +2072,9 @@ def test_get_latest_response_text_js_fallback_when_selectors_fail():
     """_get_latest_response_text should fall back to JS extraction when CSS selectors return nothing."""
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2241,19 +2082,17 @@ def test_get_latest_response_text_js_fallback_when_selectors_fail():
     )
     engine.response_area_selectors = ["div.assistant", "div.alternate"]
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = []
-    mock_driver.execute_script.return_value = "JS fallback text"
+    tab = make_tab(evaluate=AsyncMock(return_value="JS fallback text"))
 
-    result = engine._get_latest_response_text(mock_driver)
+    result = asyncio.run(engine._get_latest_response_text(tab))
     assert result == "JS fallback text"
 
 def test_sync_generate_response_retries_on_redirect_stall():
-    """_sync_generate_response must retry once on redirect-stall without resetting the driver."""
+    """The retry loop must retry once on redirect-stall without resetting the driver."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2262,18 +2101,22 @@ def test_sync_generate_response_retries_on_redirect_stall():
 
     call_count = 0
 
-    def fake_once(prompt):
+    async def fake_once(prompt, media=None):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise RuntimeError("redirect-stall: send not accepted after redirect")
         return "ok response"
 
-    engine._sync_generate_response_once = fake_once
+    engine._generate_response_once = fake_once
     reset_called = []
-    engine._reset_driver = lambda: reset_called.append(True)
 
-    result = engine._sync_generate_response("hello")
+    async def fake_reset():
+        reset_called.append(True)
+
+    engine._reset_driver = fake_reset
+
+    result = asyncio.run(engine._generate_response_retry_loop("hello"))
     assert result == "ok response"
     assert call_count == 2
     assert reset_called == [], "Driver must NOT be reset on redirect-stall"
@@ -2283,15 +2126,15 @@ def test_sync_generate_response_page_refresh_budget_persists_across_attempts():
     """A perpetually-stuck stop button must not cause an infinite refresh loop.
 
     Regression: _page_refresh_attempts was reset to 0 at the start of every
-    _sync_generate_response_once, so the page-refresh budget replenished on each
-    attempt and the paste → send → refresh cycle never terminated. The budget
-    must be reset once per request and shared across attempts, so that once it
-    is exhausted the engine falls back to a driver reset instead of looping.
+    single attempt, so the page-refresh budget replenished on each attempt and
+    the paste → send → refresh cycle never terminated. The budget must be
+    reset once per request and shared across attempts, so that once it is
+    exhausted the engine falls back to a driver reset instead of looping.
     """
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2302,7 +2145,7 @@ def test_sync_generate_response_page_refresh_budget_persists_across_attempts():
     call_count = 0
     reset_called = []
 
-    def fake_once(prompt):
+    async def fake_once(prompt, media=None):
         nonlocal call_count
         call_count += 1
         # Simulate _wait_for_response detecting a stuck stop button: it bumps the
@@ -2314,18 +2157,20 @@ def test_sync_generate_response_page_refresh_budget_persists_across_attempts():
             "_wait_for_response — page refreshed, retry without driver reset"
         )
 
-    engine._sync_generate_response_once = fake_once
+    engine._generate_response_once = fake_once
 
-    def fake_reset():
+    async def fake_reset():
         reset_called.append(True)
         # A real driver reset also clears the refresh counter; mirror that here.
         engine._page_refresh_attempts = 0
         # After the reset the page is clean, so the next attempt succeeds.
-        engine._sync_generate_response_once = lambda prompt: "recovered"
+        async def _recovered(prompt, media=None):
+            return "recovered"
+        engine._generate_response_once = _recovered
 
     engine._reset_driver = fake_reset
 
-    result = engine._sync_generate_response("hello")
+    result = asyncio.run(engine._generate_response_retry_loop("hello"))
 
     assert result == "recovered"
     # Once the budget is exhausted the engine resets the driver exactly once.
@@ -2338,11 +2183,11 @@ def test_sync_generate_response_page_refresh_budget_persists_across_attempts():
 
 
 def test_sync_generate_response_retries_on_response_detection_timeout():
-    """_sync_generate_response retries with driver reset when response detection times out."""
+    """The retry loop retries with driver reset when response detection times out."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2351,7 +2196,7 @@ def test_sync_generate_response_retries_on_response_detection_timeout():
 
     call_count = 0
 
-    def fake_once(prompt):
+    async def fake_once(prompt, media=None):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -2360,53 +2205,65 @@ def test_sync_generate_response_retries_on_response_detection_timeout():
             )
         return "real response"
 
-    engine._sync_generate_response_once = fake_once
+    engine._generate_response_once = fake_once
     reset_called = []
-    engine._reset_driver = lambda: reset_called.append(True)
 
-    result = engine._sync_generate_response("hello")
+    async def fake_reset():
+        reset_called.append(True)
+
+    engine._reset_driver = fake_reset
+
+    result = asyncio.run(engine._generate_response_retry_loop("hello"))
     assert result == "real response"
     assert call_count == 2
     assert reset_called == [True], "Driver MUST be reset on response detection timeout"
 
 
 def test_sync_generate_response_once_retries_on_stale_element():
-    """_sync_generate_response_once should retry once when a stale element occurs."""
+    """_generate_response_once should retry once when a stale element occurs.
+
+    Pre-existing behavior note: the exact trigger point for a "stale element"
+    differs from the old Selenium version (see core/zendriver_llm_base.py's
+    ``_is_stale_element_error`` docstring — zendriver has no dedicated
+    staleness exception type), so this simulates it via ``_click_send``
+    raising a "could not find node" error, which is the realistic zendriver
+    analogue."""
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
-    from selenium.common.exceptions import StaleElementReferenceException
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    engine.driver = MagicMock()
+    engine.driver = make_tab(url="https://example.com")
     engine._initialized = True
-    engine.driver.current_url = "https://example.com"
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.refresh_login_state = AsyncMock(return_value=True)
 
-    engine._find_interactable_element = lambda driver, selectors, timeout, cache_attr=None: MagicMock()
-    engine._fill_input = lambda driver, el, prompt: None
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
-    engine._post_send_check = lambda driver: True
-    engine._wait_for_response = lambda driver: "final response"
+    engine._find_interactable_element = AsyncMock(return_value=make_element())
+    engine._fill_input = AsyncMock(return_value=None)
+    engine._click_accept_buttons = AsyncMock(return_value=None)
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
+    engine._post_send_check = AsyncMock(return_value=True)
+    engine._wait_for_response = AsyncMock(return_value="final response")
     engine._is_dead_session = lambda exc: False
 
     call_count = 0
 
-    def fake_click_send(driver, input_el):
+    async def fake_click_send(tab, input_el):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            raise StaleElementReferenceException("stale element")
+            raise Exception("could not find node: stale element")
         return None
 
     engine._click_send = fake_click_send
 
-    result = engine._sync_generate_response_once("hello")
+    result = asyncio.run(engine._generate_response_once("hello"))
     assert result == "final response"
     assert call_count == 2
 
@@ -2414,10 +2271,9 @@ def test_sync_generate_response_once_retries_on_stale_element():
 def test_wait_for_response_raises_on_detection_timeout(monkeypatch):
     """_wait_for_response raises RuntimeError when no new text is found within timeout."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2426,26 +2282,22 @@ def test_wait_for_response_raises_on_detection_timeout(monkeypatch):
     engine.response_area_selectors = ["div.response"]
     engine.stop_selectors = []
 
-    # Driver always returns the same text (no new text ever appears)
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = []  # no stop buttons, no response elements
-    mock_driver.current_url = "https://example.com"
+    # Tab always returns no elements (no stop buttons, no response elements)
+    tab = make_tab(url="https://example.com")
 
-    # Patch env vars to use short timeouts so the test doesn't block
-    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
     monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
     with pytest.raises(RuntimeError, match="selenium_response_detection_timeout"):
-        engine._wait_for_response(mock_driver)
+        asyncio.run(engine._wait_for_response(tab))
 
 
 def test_wait_for_response_returns_best_effort_when_first_new_set(monkeypatch):
-    """_wait_for_response returns best-effort text when first_new was set before max_wait."""
+    """_wait_for_response returns best-effort text when new text appears before max_wait."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2456,23 +2308,19 @@ def test_wait_for_response_returns_best_effort_when_first_new_set(monkeypatch):
 
     call_count = 0
 
-    def fake_find_elements(by, selector):
+    async def query_side_effect(sel):
         nonlocal call_count
         call_count += 1
-        if selector == "div.response" and call_count > 2:
-            el = MagicMock()
-            el.text = "new response text"
-            return [el]
+        if sel == "div.response" and call_count > 2:
+            return [make_element(apply_result="new response text")]
         return []
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.side_effect = fake_find_elements
-    mock_driver.current_url = "https://example.com"
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect), url="https://example.com")
 
-    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
     monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "1")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
-    result = engine._wait_for_response(mock_driver)
+    result = asyncio.run(engine._wait_for_response(tab))
     # There is new text, so it should be returned (either from main loop or best-effort)
     # The exact return depends on timing, but it should not raise.
     assert result in ("new response text", "")
@@ -2481,10 +2329,10 @@ def test_wait_for_response_returns_best_effort_when_first_new_set(monkeypatch):
 def test_wait_for_response_silent_freeze_triggers_page_refresh(monkeypatch):
     """_wait_for_response should attempt page refresh on silent freeze and raise page_refresh_required."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock, patch
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from unittest.mock import patch
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2495,24 +2343,15 @@ def test_wait_for_response_silent_freeze_triggers_page_refresh(monkeypatch):
     engine._max_page_refresh_attempts = 2
     engine._page_refresh_attempts = 0
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com"
-
     # Simulate stop button visible but no response text ever appears
-    def fake_find_elements(by, selector):
-        if selector == "button.stop":
-            btn = MagicMock()
-            btn.is_displayed.return_value = True
-            return [btn]
+    async def query_side_effect(sel):
+        if sel == "button.stop":
+            return [make_element()]
         return []
 
-    mock_driver.find_elements.side_effect = fake_find_elements
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect), url="https://example.com")
+    engine._wait_for_page_ready = AsyncMock(return_value=True)
 
-    # Make refresh succeed and page ready return True
-    mock_driver.refresh = MagicMock()
-    engine._wait_for_page_ready = MagicMock(return_value=True)
-
-    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
     monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
     # Low freeze threshold so the silent-freeze condition triggers quickly once
     # the (advancing) fake clock passes it.
@@ -2528,22 +2367,22 @@ def test_wait_for_response_silent_freeze_triggers_page_refresh(monkeypatch):
         return fake_time[0]
 
     with patch("time.time", side_effect=fake_time_func), \
-         patch("time.sleep", lambda *_: None):
+         patch("asyncio.sleep", AsyncMock()):
         with pytest.raises(RuntimeError, match="page_refresh_required"):
-            engine._wait_for_response(mock_driver)
+            asyncio.run(engine._wait_for_response(tab))
 
     assert engine._page_refresh_attempts == 1
-    mock_driver.refresh.assert_called_once()
-    engine._wait_for_page_ready.assert_called_once_with(mock_driver, timeout=30.0)
+    tab.reload.assert_called_once()
+    engine._wait_for_page_ready.assert_called_once_with(tab, timeout=30.0)
 
 
 def test_wait_for_response_silent_freeze_resets_driver_after_max_refreshes(monkeypatch):
-    """_wait_for_response should raise TimeoutException after max page refresh attempts."""
+    """_wait_for_response should raise asyncio.TimeoutError after max page refresh attempts."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock, patch
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from unittest.mock import patch
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2554,19 +2393,13 @@ def test_wait_for_response_silent_freeze_resets_driver_after_max_refreshes(monke
     engine._max_page_refresh_attempts = 1
     engine._page_refresh_attempts = 1  # already at max
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com"
-
-    def fake_find_elements(by, selector):
-        if selector == "button.stop":
-            btn = MagicMock()
-            btn.is_displayed.return_value = True
-            return [btn]
+    async def query_side_effect(sel):
+        if sel == "button.stop":
+            return [make_element()]
         return []
 
-    mock_driver.find_elements.side_effect = fake_find_elements
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect), url="https://example.com")
 
-    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
     monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
     monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "5")
 
@@ -2579,12 +2412,12 @@ def test_wait_for_response_silent_freeze_resets_driver_after_max_refreshes(monke
         return fake_time[0]
 
     with patch("time.time", side_effect=fake_time_func), \
-         patch("time.sleep", lambda *_: None):
-        with pytest.raises(TimeoutException, match="silent freeze detected"):
-            engine._wait_for_response(mock_driver)
+         patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(asyncio.TimeoutError, match="silent freeze detected"):
+            asyncio.run(engine._wait_for_response(tab))
 
-    # refresh should NOT be called because we are already at max attempts
-    mock_driver.refresh.assert_not_called()
+    # reload should NOT be called because we are already at max attempts
+    tab.reload.assert_not_called()
 
 
 def test_wait_for_response_error_indicator_navigates_to_service_home(monkeypatch):
@@ -2597,10 +2430,10 @@ def test_wait_for_response_error_indicator_navigates_to_service_home(monkeypatch
     resends the full prompt without a full driver reset.
     """
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock, patch
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from unittest.mock import patch
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com/home",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2615,24 +2448,19 @@ def test_wait_for_response_error_indicator_navigates_to_service_home(monkeypatch
     engine._page_refresh_attempts = 0
     engine._skip_split_for_next = True
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com/home"
-
     # No response text ever appears, but an error toast is visible from the
     # first iteration so the error-indicator branch triggers immediately.
-    def fake_find_elements(by, selector):
-        if selector == "div.error-toast":
-            toast = MagicMock()
-            toast.is_displayed.return_value = True
-            toast.text = "Something went wrong (1076)"
-            return [toast]
+    async def query_side_effect(sel):
+        if sel == "div.error-toast":
+            return [make_element(apply_result="Something went wrong (1076)")]
         return []
 
-    mock_driver.find_elements.side_effect = fake_find_elements
-    mock_driver.get = MagicMock()
-    engine._wait_for_page_ready = MagicMock(return_value=True)
+    tab = make_tab(
+        query_selector_all=AsyncMock(side_effect=query_side_effect),
+        url="https://example.com/home",
+    )
+    engine._wait_for_page_ready = AsyncMock(return_value=True)
 
-    monkeypatch.setenv("SELENIUM_RESPONSE_INITIAL_TIMEOUT", "0.05")
     monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
     monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "5")
 
@@ -2645,15 +2473,15 @@ def test_wait_for_response_error_indicator_navigates_to_service_home(monkeypatch
         return fake_time[0]
 
     with patch("time.time", side_effect=fake_time_func), \
-         patch("time.sleep", lambda *_: None):
+         patch("asyncio.sleep", AsyncMock()):
         with pytest.raises(RuntimeError, match="page_refresh_required"):
-            engine._wait_for_response(mock_driver)
+            asyncio.run(engine._wait_for_response(tab))
 
     assert engine._page_refresh_attempts == 1
     # Navigated to the service home (not a plain refresh).
-    mock_driver.get.assert_called_once_with("https://example.com/home")
-    mock_driver.refresh.assert_not_called()
-    engine._wait_for_page_ready.assert_called_once_with(mock_driver, timeout=30.0)
+    tab.get.assert_called_once_with("https://example.com/home")
+    tab.reload.assert_not_called()
+    engine._wait_for_page_ready.assert_called_once_with(tab, timeout=30.0)
     # Selector caches invalidated and full-resend forced for the next attempt.
     assert engine._cached_prompt_selector is None
     assert engine._cached_send_selector is None
@@ -2670,13 +2498,12 @@ def test_wait_for_response_block_generation_with_stop_button_does_not_refresh(mo
     response and causing an infinite paste → send → refresh loop.
 
     _wait_for_response must instead let the response arrive and return it,
-    without ever calling driver.refresh().
+    without ever calling tab.reload().
     """
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2685,45 +2512,42 @@ def test_wait_for_response_block_generation_with_stop_button_does_not_refresh(mo
     engine.response_area_selectors = ["div.response"]
     engine.stop_selectors = ["button.stop"]
     engine.accept_button_selectors = []
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
+    engine._click_accept_buttons = AsyncMock()
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
     # Stop button stays visible throughout the whole block generation.
-    engine._stop_button_present = lambda driver: True
+    engine._stop_button_present = AsyncMock(return_value=True)
 
-    fake_element = MagicMock()
+    fake_element = make_element()
     # No text for the first few polls (thinking), then the whole block appears
     # and stays stable — mimicking non-incremental generation.
     stats = [(0, 0), (0, 0), (120, 3), (120, 3), (120, 3)]
     call_count = {"n": 0}
 
-    def fake_get_stats(_driver, _element):
+    async def fake_get_stats(_element):
         call_count["n"] += 1
         return stats[min(call_count["n"] - 1, len(stats) - 1)]
 
-    engine._find_response_container_element = lambda driver: (fake_element, "div.response")
+    engine._find_response_container_element = AsyncMock(return_value=(fake_element, "div.response"))
     engine._get_response_container_stats = fake_get_stats
-    engine._extract_response_text_from_element = lambda driver, element: "block response"
+    engine._extract_response_text_from_element = AsyncMock(return_value="block response")
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com"
+    tab = make_tab(url="https://example.com")
 
-    with monkeypatch.context() as m:
-        m.setattr("time.sleep", lambda *_: None)
-        result = engine._wait_for_response(mock_driver, max_wait=10)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    result = asyncio.run(engine._wait_for_response(tab, max_wait=10))
 
     assert result == "block response"
-    mock_driver.refresh.assert_not_called()
+    tab.reload.assert_not_called()
     assert engine._page_refresh_attempts == 0
 
 
 def test_wait_for_response_watcher_stable_container_returns_text(monkeypatch):
     """_wait_for_response should return text after the generic container watcher sees stability."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2731,28 +2555,26 @@ def test_wait_for_response_watcher_stable_container_returns_text(monkeypatch):
     )
     engine.response_area_selectors = ["div.response"]
     engine.accept_button_selectors = []
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    engine._click_accept_buttons = AsyncMock()
 
-    fake_element = MagicMock()
+    fake_element = make_element()
     stats = [(0, 0), (5, 1), (5, 1), (5, 1)]
     call_count = {"n": 0}
 
-    def fake_get_stats(_driver, _element):
+    async def fake_get_stats(_element):
         call_count["n"] += 1
         return stats[min(call_count["n"] - 1, len(stats) - 1)]
 
-    engine._find_response_container_element = lambda driver: (fake_element, "div.response")
+    engine._find_response_container_element = AsyncMock(return_value=(fake_element, "div.response"))
     engine._get_response_container_stats = fake_get_stats
-    engine._extract_response_text_from_element = lambda driver, element: "final response"
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
+    engine._extract_response_text_from_element = AsyncMock(return_value="final response")
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com"
+    tab = make_tab(url="https://example.com")
 
-    with monkeypatch.context() as m:
-        m.setattr("time.sleep", lambda *_: None)
-        result = engine._wait_for_response(mock_driver, max_wait=10)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    result = asyncio.run(engine._wait_for_response(tab, max_wait=10))
 
     assert result == "final response"
 
@@ -2760,10 +2582,9 @@ def test_wait_for_response_watcher_stable_container_returns_text(monkeypatch):
 def test_wait_for_response_watcher_initial_stable_response_returns_text(monkeypatch):
     """_wait_for_response should return text when the response is already stable on first poll."""
     import tempfile
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2771,28 +2592,26 @@ def test_wait_for_response_watcher_initial_stable_response_returns_text(monkeypa
     )
     engine.response_area_selectors = ["div.response"]
     engine.accept_button_selectors = []
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
+    engine._click_accept_buttons = AsyncMock()
 
-    fake_element = MagicMock()
+    fake_element = make_element()
     stats = [(5, 1), (5, 1), (5, 1)]
     call_count = {"n": 0}
 
-    def fake_get_stats(_driver, _element):
+    async def fake_get_stats(_element):
         call_count["n"] += 1
         return stats[min(call_count["n"] - 1, len(stats) - 1)]
 
-    engine._find_response_container_element = lambda driver: (fake_element, "div.response")
+    engine._find_response_container_element = AsyncMock(return_value=(fake_element, "div.response"))
     engine._get_response_container_stats = fake_get_stats
-    engine._extract_response_text_from_element = lambda driver, element: "final response"
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
+    engine._extract_response_text_from_element = AsyncMock(return_value="final response")
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com"
+    tab = make_tab(url="https://example.com")
 
-    with monkeypatch.context() as m:
-        m.setattr("time.sleep", lambda *_: None)
-        result = engine._wait_for_response(mock_driver, max_wait=10)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    result = asyncio.run(engine._wait_for_response(tab, max_wait=10))
 
     assert result == "final response"
 
@@ -2804,9 +2623,9 @@ def test_wait_for_response_watcher_initial_stable_response_returns_text(monkeypa
 
 def test_should_split_prompt_below_limit():
     """_should_split_prompt must return False when the prompt fits within the limit."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
@@ -2818,9 +2637,9 @@ def test_should_split_prompt_below_limit():
 
 def test_should_split_prompt_above_limit():
     """_should_split_prompt must return True when the prompt exceeds the limit."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
@@ -2831,9 +2650,9 @@ def test_should_split_prompt_above_limit():
 
 def test_should_split_prompt_disabled_when_parts_le_1():
     """_should_split_prompt must return False when SELENIUM_SPLIT_PROMPT_PARTS <= 1."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
@@ -2844,9 +2663,9 @@ def test_should_split_prompt_disabled_when_parts_le_1():
 
 def test_split_prompt_into_parts_count_and_coverage():
     """_split_prompt_into_parts must produce exactly n parts that together reconstruct the prompt."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2860,9 +2679,9 @@ def test_split_prompt_into_parts_count_and_coverage():
 def test_split_prompt_into_parts_chunks_within_limit():
     """Each chunk produced must be <= ceil(len/n) characters."""
     import math
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2878,10 +2697,10 @@ def test_split_prompt_into_parts_chunks_within_limit():
 def test_split_prompt_keeps_tail_marker_in_final_chunk():
     """When the protected tail marker is present, everything after it must land
     intact in the LAST chunk and the marker itself must be stripped."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
     from core.agent_protocol import AGENT_TAIL_MARKER
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -2899,34 +2718,33 @@ def test_split_prompt_keeps_tail_marker_in_final_chunk():
 
 def test_execute_chunked_send_invokes_driver_n_times():
     """_execute_chunked_send must call _fill_input and _click_send once per chunk."""
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
     )
     engine._split_prompt_parts = 3
 
-    fake_el = MagicMock()
+    fake_el = make_element()
     fill_calls: list[str] = []
     click_calls: list[int] = []
     response_counter = [0]
 
-    def fake_find_interactable(*args, **kwargs):
+    async def fake_find_interactable(*args, **kwargs):
         return fake_el
 
-    def fake_fill(driver, element, text):
+    async def fake_fill(driver, element, text):
         fill_calls.append(text)
 
-    def fake_click(driver, element):
+    async def fake_click(driver, element):
         click_calls.append(1)
 
-    def fake_post_send_check(driver, **kwargs):
+    async def fake_post_send_check(driver, **kwargs):
         return True
 
-    def fake_wait_response(driver, **kwargs):
+    async def fake_wait_response(driver, **kwargs):
         response_counter[0] += 1
         return f"OK part {response_counter[0]}"
 
@@ -2937,12 +2755,14 @@ def test_execute_chunked_send_invokes_driver_n_times():
     engine._wait_for_response = fake_wait_response
     # With pre-fill optimisation, _wait_for_send_ready replaces _wait_for_response
     # for intermediate chunks — mock it to return True immediately.
-    engine._wait_for_send_ready = lambda d, **kw: True
+    engine._wait_for_send_ready = AsyncMock(return_value=True)
+    engine._click_accept_buttons = AsyncMock()
+    engine._stop_button_present = AsyncMock(return_value=False)
 
     # 301-char prompt with limit=100 → ceil(301/100)=4 parts min, but env_max=3
     # So n = min(3, max(ceil(301/100), 2)) = min(3, 4) = 3
     prompt = "Z" * 301
-    result = engine._execute_chunked_send(prompt, MagicMock())
+    result = asyncio.run(engine._execute_chunked_send(prompt, make_tab()))
 
     assert len(fill_calls) == 3
     assert len(click_calls) == 3
@@ -2955,28 +2775,35 @@ def test_execute_chunked_send_invokes_driver_n_times():
 
 def test_execute_chunked_send_intermediate_headers():
     """Intermediate chunks must carry the [PART {i}/{n}] header."""
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
     )
     engine._split_prompt_parts = 3
 
-    fake_el = MagicMock()
+    fake_el = make_element()
     fill_calls: list[str] = []
 
-    engine._find_interactable_element = lambda *a, **kw: fake_el
-    engine._fill_input = lambda d, e, text: fill_calls.append(text)
-    engine._click_send = lambda d, e: None
-    engine._post_send_check = lambda d, **kw: True
-    engine._wait_for_response = lambda d, **kw: "OK"
-    engine._wait_for_send_ready = lambda d, **kw: True
+    async def fake_find_interactable(*a, **kw):
+        return fake_el
+
+    async def fake_fill(d, e, text):
+        fill_calls.append(text)
+
+    engine._find_interactable_element = fake_find_interactable
+    engine._fill_input = fake_fill
+    engine._click_send = AsyncMock()
+    engine._post_send_check = AsyncMock(return_value=True)
+    engine._wait_for_response = AsyncMock(return_value="OK")
+    engine._wait_for_send_ready = AsyncMock(return_value=True)
+    engine._click_accept_buttons = AsyncMock()
+    engine._stop_button_present = AsyncMock(return_value=False)
 
     prompt = "X" * 301
-    engine._execute_chunked_send(prompt, MagicMock())
+    asyncio.run(engine._execute_chunked_send(prompt, make_tab()))
 
     # Intermediate chunks (all but the last) must carry the header
     n = len(fill_calls)
@@ -2994,9 +2821,9 @@ def test_execute_chunked_send_prefill_before_wait():
 
 def test_skip_split_flag_prevents_recursion():
     """When _skip_split_for_next is True, _should_split_prompt is bypassed."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
@@ -3130,11 +2957,10 @@ def test_queue_fifo_serializes_requests():
 def test_send_button_present_returns_true_when_visible():
     """_send_button_present must return True when a send button element is visible."""
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3142,24 +2968,18 @@ def test_send_button_present_returns_true_when_visible():
     )
     engine.send_button_selectors = ["button[aria-label='Send message']"]
 
-    fake_btn = MagicMock()
-    fake_btn.is_displayed.return_value = True
-    fake_btn.is_enabled.return_value = True
+    tab = make_tab(query_selector_all=AsyncMock(return_value=[make_element()]))
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = [fake_btn]
-
-    assert engine._send_button_present(mock_driver) is True
+    assert asyncio.run(engine._send_button_present(tab)) is True
 
 
 def test_send_button_present_returns_false_when_absent():
     """_send_button_present must return False when no enabled send button is found."""
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3167,10 +2987,9 @@ def test_send_button_present_returns_false_when_absent():
     )
     engine.send_button_selectors = ["button[aria-label='Send message']"]
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.return_value = []
+    tab = make_tab()  # query_selector_all() -> [] always
 
-    assert engine._send_button_present(mock_driver) is False
+    assert asyncio.run(engine._send_button_present(tab)) is False
 
 
 def test_post_send_check_fallback_when_send_button_absent():
@@ -3180,11 +2999,10 @@ def test_post_send_check_fallback_when_send_button_absent():
     - but the send button has disappeared (generation accepted by LLM)
     """
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3192,26 +3010,24 @@ def test_post_send_check_fallback_when_send_button_absent():
     )
     engine.stop_selectors = []          # primary check always skipped
     engine.send_button_selectors = ["button[aria-label='Send message']"]
-    engine.response_area_selectors = [".response"]
+    engine.response_area_selectors = []
 
-    mock_driver = MagicMock()
     # No elements found for any selector → stop absent, text empty, send absent
-    mock_driver.find_elements.return_value = []
-    mock_driver.current_url = "https://example.com"
+    tab = make_tab(url="https://example.com")
 
-    result = engine._post_send_check(mock_driver, timeout=1.0)
-    # Send button absent → generation in progress → True
+    result = asyncio.run(engine._post_send_check(tab, timeout=1.0))
+    # Send button and response area both absent → still no signal either
+    # way, so the plain "URL looks ok, assume slow model" timeout path wins.
     assert result is True
 
 
 def test_post_send_check_fallback_requires_response_area():
     """_post_send_check must recognize generation only when the response area exists."""
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3221,18 +3037,16 @@ def test_post_send_check_fallback_requires_response_area():
     engine.send_button_selectors = ["button.send"]
     engine.response_area_selectors = [".response"]
 
-    def find_elements(by, selector):
-        if selector == "button.send":
+    async def query_side_effect(sel):
+        if sel == "button.send":
             return []
-        if selector == ".response":
-            return [MagicMock()]
+        if sel == ".response":
+            return [make_element()]
         return []
 
-    mock_driver = MagicMock()
-    mock_driver.find_elements.side_effect = find_elements
-    mock_driver.current_url = "https://example.com"
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=query_side_effect), url="https://example.com")
 
-    assert engine._post_send_check(mock_driver, timeout=0.5) is True
+    assert asyncio.run(engine._post_send_check(tab, timeout=0.5)) is True
 
 
 def test_wait_for_response_initial_phase_fallback_send_button_absent():
@@ -3243,11 +3057,11 @@ def test_wait_for_response_initial_phase_fallback_send_button_absent():
     without requiring any send-button check.
     """
     import tempfile
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3263,28 +3077,29 @@ def test_wait_for_response_initial_phase_fallback_send_button_absent():
     # _get_latest_response_text: first call (baseline) = "", then stable response
     text_calls = [0]
 
-    def _get_text(_driver: object) -> str:
+    def _get_text(_tab: object) -> str:
         text_calls[0] += 1
         return "" if text_calls[0] == 1 else response_text
 
     # _send_button_present is used only in initial-phase fallback, not in Phase 2
     send_calls = [0]
 
-    def _send_present(_driver: object) -> bool:
+    def _send_present(_tab: object) -> bool:
         send_calls[0] += 1
         # First two checks: absent (generating); from third onwards: present (done)
         return send_calls[0] > 2
 
-    mock_driver = MagicMock()
-    mock_driver.current_url = "https://example.com"
-    mock_driver.find_elements.return_value = []
+    tab = make_tab(url="https://example.com")
 
+    # patch.object auto-detects these are `async def` on the real class and
+    # wraps side_effect in an AsyncMock, so a plain (non-async) side_effect
+    # function works unchanged here.
     with (
         patch.object(engine, "_get_latest_response_text", side_effect=_get_text),
         patch.object(engine, "_send_button_present", side_effect=_send_present),
-        patch("time.sleep", return_value=None),
+        patch("asyncio.sleep", AsyncMock()),
     ):
-        result = engine._wait_for_response(mock_driver, max_wait=10)
+        result = asyncio.run(engine._wait_for_response(tab, max_wait=10))
 
     assert result == response_text
 
@@ -3298,7 +3113,7 @@ def test_wait_for_response_initial_phase_fallback_send_button_absent():
 # short-lived, rotating anti-replay cookie (e.g. Google's __Secure-1PSIDTS)
 # looked like session hijacking to the site's own security systems and
 # triggered the very logout it was meant to prevent (observed live against
-# Gemini). See the note above _save_cookies in core/selenium_llm_base.py.
+# Gemini). See the note above _save_cookies in core/zendriver_llm_base.py.
 # ---------------------------------------------------------------------------
 
 
@@ -3306,9 +3121,9 @@ def test_save_cookies_is_a_noop(tmp_path):
     """No custom persistence — Chrome's own profile is the only mechanism."""
     from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3326,9 +3141,9 @@ def test_save_cookies_is_a_noop(tmp_path):
 def test_restore_cookies_is_a_noop_but_marks_restored(tmp_path):
     from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3346,9 +3161,9 @@ def test_restore_cookies_is_a_noop_but_marks_restored(tmp_path):
 def test_maybe_save_cookies_is_a_noop_regardless_of_interval(tmp_path):
     from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3364,9 +3179,9 @@ def test_maybe_save_cookies_is_a_noop_regardless_of_interval(tmp_path):
 
 def test_cookie_path_uses_engine_name(tmp_path):
     """_cookie_path includes ENGINE_NAME in the filename."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3378,9 +3193,9 @@ def test_cookie_path_uses_engine_name(tmp_path):
 
 def test_cookie_path_default_without_engine_name(tmp_path):
     """_cookie_path falls back to 'default' when ENGINE_NAME is not set."""
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3389,53 +3204,258 @@ def test_cookie_path_default_without_engine_name(tmp_path):
     assert engine._cookie_path().endswith("cookies_default.json")
 
 
-def test_build_options_includes_restore_session():
-    """_build_options adds --restore-last-session and session prefs."""
-    from core.selenium_llm_base import SeleniumLLMBase
+def test_remove_profile_lock_files_removes_dangling_symlink(tmp_path):
+    """Regression: SingletonLock is a symlink to "<hostname>-<pid>", a target
+    that never exists as a real path. os.path.exists() follows symlinks and
+    returns False for a dangling one, so a prior version of this function
+    guarded the removal with `if os.path.exists(path): os.remove(path)` and
+    silently never removed it. Observed live: a lock file left in the
+    (persistent-volume) profile dir by a container's previous instance --
+    a different hostname -- blocked every browser relaunch after a rebuild
+    with "profile appears to be in use by another Chromium process ... on
+    another computer" until the container was manually cleaned up.
+    """
+    import core.zendriver_llm_base as zlb
 
-    engine = SeleniumLLMBase(
+    lock = tmp_path / "SingletonLock"
+    lock.symlink_to("some-other-hostname-12345")  # dangling on purpose
+    assert not lock.exists()  # exists() correctly reports False here
+    assert lock.is_symlink()  # but the link itself is real and must be removed
+
+    zlb._remove_profile_lock_files(str(tmp_path))
+
+    assert not lock.is_symlink()
+
+
+def test_remove_profile_lock_files_tolerates_missing_files(tmp_path):
+    """No lock files present at all must not raise."""
+    import core.zendriver_llm_base as zlb
+
+    zlb._remove_profile_lock_files(str(tmp_path))  # must not raise
+
+
+def test_protected_pids_empty_when_no_active_browser(monkeypatch):
+    monkeypatch.setattr(
+        "core.zendriver_llm_base.get_shared_browser_pid", lambda: None
+    )
+    mgr = EngineManager.get()
+    assert mgr._protected_pids() == set()
+
+
+def test_protected_pids_includes_root_and_descendants(monkeypatch):
+    """The active browser's whole process tree must be protected, not just
+    its root PID -- a long-open tab's renderer process has its own,
+    independently old start time and would otherwise still look orphaned."""
+    import core.engine_manager as em
+
+    monkeypatch.setattr(
+        "core.zendriver_llm_base.get_shared_browser_pid", lambda: 100
+    )
+
+    children = {100: [200, 201], 200: [300], 201: [], 300: []}
+
+    def fake_run(cmd, **kwargs):
+        result = MagicMock()
+        if cmd[:2] == ["pgrep", "-P"]:
+            parent = int(cmd[2])
+            result.stdout = "\n".join(str(c) for c in children.get(parent, []))
+        else:
+            result.stdout = ""
+        return result
+
+    monkeypatch.setattr(em.subprocess, "run", fake_run)
+
+    mgr = EngineManager.get()
+    assert mgr._protected_pids() == {100, 200, 201, 300}
+
+
+def test_cleanup_orphans_never_kills_protected_pid(monkeypatch):
+    """Regression: _cleanup_orphans used to kill *any* chromium process older
+    than SELENIUM_ORPHAN_AGE_THRESHOLD, with no notion of "in use" -- masked
+    for a long time because the browser used to be recycled every ~300s by
+    the (since-raised) session-hard-timeout default, always well under the
+    600s orphan threshold. Once a long-lived shared browser became the
+    normal state, this started SIGKILLing the live browser out from under
+    in-flight requests every 5 minutes (observed live as an immediate
+    "no close frame received or sent" CDP-transport error)."""
+    import io
+    import builtins
+
+    import core.engine_manager as em
+
+    mgr = EngineManager.get()
+    monkeypatch.setattr(mgr, "_protected_pids", lambda: {4242})
+    monkeypatch.setenv("SELENIUM_ORPHAN_AGE_THRESHOLD", "600")
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append(cmd)
+        result = MagicMock()
+        if cmd[:2] == ["pgrep", "-f"]:
+            result.stdout = "4242\n9999\n"
+        else:
+            result.stdout = ""
+        return result
+
+    monkeypatch.setattr(em.subprocess, "run", fake_run)
+
+    real_open = builtins.open
+
+    def fake_open(path, *a, **kw):
+        if path == "/proc/uptime":
+            return io.StringIO("100000.0 90000.0\n")
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/stat"):
+            fields = ["x"] * 22
+            fields[21] = "0"  # starttime=0 ticks -> looks maximally old
+            return io.StringIO(" ".join(fields))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    mgr._cleanup_orphans()
+
+    kill_targets = [c[-1] for c in run_calls if c and c[0] == "kill"]
+    assert "4242" not in kill_targets
+    assert "9999" in kill_targets
+
+
+def test_is_dead_session_recognises_closed_cdp_websocket(tmp_path):
+    """Regression: zendriver's CDP transport raises "no close frame received
+    or sent" (via the `websockets` library) when the browser process itself
+    died and the underlying TCP connection dropped without a proper WS close
+    handshake. This message wasn't in the dead-session marker list, so every
+    retry kept hitting the same dead connection and failed in ~1ms instead of
+    the browser ever getting recreated -- observed live."""
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
+        profile_dir=str(tmp_path),
     )
-    options = engine._build_options()
-    args = options.arguments
+    assert engine._is_dead_session(Exception("no close frame received or sent"))
+    assert not engine._is_dead_session(Exception("could not find node: stale element"))
+
+
+def test_generate_response_serializes_across_engines(tmp_path):
+    """Regression: EngineManager gives each engine its own FIFO queue and
+    worker task, which only serialises requests to the *same* engine --
+    nothing stopped two different engines' workers from driving the one
+    shared browser tab at the same time. Observed live: switching from a
+    still-running Copilot request to ChatGPT mid-flight let both coroutines
+    type/click/navigate the same tab concurrently, corrupting both and
+    eventually forcing a nuclear browser reset. generate_response on two
+    different engine instances must never interleave."""
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    engine_a = ZendriverLLMBase(
+        service_url="https://a.example.com", model_limits_map={"default": 1000},
+        default_model="default", profile_dir=str(tmp_path / "a"),
+    )
+    engine_b = ZendriverLLMBase(
+        service_url="https://b.example.com", model_limits_map={"default": 1000},
+        default_model="default", profile_dir=str(tmp_path / "b"),
+    )
+
+    events: list[str] = []
+
+    async def fake_retry_loop_a(prompt, media):
+        events.append("a-start")
+        await asyncio.sleep(0.05)  # long enough that b would interleave if unlocked
+        events.append("a-end")
+        return "a-response"
+
+    async def fake_retry_loop_b(prompt, media):
+        events.append("b-start")
+        await asyncio.sleep(0.01)
+        events.append("b-end")
+        return "b-response"
+
+    engine_a._generate_response_retry_loop = fake_retry_loop_a
+    engine_b._generate_response_retry_loop = fake_retry_loop_b
+
+    async def run_both():
+        return await asyncio.gather(
+            engine_a.generate_response("hello", timeout=5),
+            engine_b.generate_response("hi", timeout=5),
+        )
+
+    results = asyncio.run(run_both())
+
+    assert results == ["a-response", "b-response"]
+    assert events in (
+        ["a-start", "a-end", "b-start", "b-end"],
+        ["b-start", "b-end", "a-start", "a-end"],
+    )
+
+
+def test_build_options_includes_restore_session():
+    """_build_config's browser_args include --restore-last-session, and
+    _ensure_clean_exit_preference writes the "clean exit" Preferences keys.
+
+    Selenium's ``prefs`` experimental option (``profile.exit_type``,
+    ``profile.exited_cleanly``) has no zendriver Config equivalent, so that
+    part is now a separate step performed by writing the profile's
+    Preferences JSON file directly — see core/zendriver_llm_base.py.
+    """
+    import json
+    import os
+    import tempfile
+
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    profile_dir = tempfile.mkdtemp()
+    engine = ZendriverLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=profile_dir,
+    )
+    config = engine._build_config("/usr/bin/chromium")
+    args = config()
     assert "--restore-last-session" in args
-    prefs = options.experimental_options.get("prefs", {})
-    assert prefs.get("profile.exit_type") == "Normal"
-    assert prefs.get("profile.exited_cleanly") is True
+
+    engine._ensure_clean_exit_preference()
+    prefs_path = os.path.join(profile_dir, "Default", "Preferences")
+    with open(prefs_path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    assert data["profile"]["exit_type"] == "Normal"
+    assert data["profile"]["exited_cleanly"] is True
 
 
 def test_sync_generate_response_dynamic_chunking_retry():
-    """Verify that _sync_generate_response increments _split_prompt_parts on chunking failure."""
-    from core.selenium_llm_base import SeleniumLLMBase
-    from unittest.mock import MagicMock, patch
+    """Verify that the retry loop increments _split_prompt_parts on chunking failure."""
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from unittest.mock import patch
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 100},
         default_model="default",
     )
     engine._split_prompt_parts = 2
-    
-    # Mocking _sync_generate_response_once to fail with a chunking message on first call
+
+    # Mocking _generate_response_once to fail with a chunking message on first call
     # and succeed on the second.
     call_count = 0
-    def mock_once(prompt, media=None):
+
+    async def mock_once(prompt, media=None):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise RuntimeError("Send button did not become ready (UI freeze simulation)")
         return "dynamic result"
 
-    engine._sync_generate_response_once = mock_once
-    engine._reset_driver = MagicMock()
-    
-    prompt = "A" * 200 # Should trigger splitting
-    
-    with patch.object(engine, '_should_split_prompt', return_value=True):
-        result = engine._sync_generate_response(prompt)
-    
+    engine._generate_response_once = mock_once
+    engine._reset_driver = AsyncMock()
+
+    prompt = "A" * 200  # Should trigger splitting
+
+    with patch.object(engine, "_should_split_prompt", return_value=True):
+        result = asyncio.run(engine._generate_response_retry_loop(prompt))
+
     assert result == "dynamic result"
     assert engine._split_prompt_parts == 3
     assert engine._reset_driver.call_count == 1
@@ -3730,45 +3750,41 @@ def test_unlogged_prompt_failure_raises(monkeypatch):
     was stored as a successful prompt and forwarded downstream as content.
     """
     import tempfile
-    from unittest.mock import MagicMock
 
-    import core.selenium_llm_base as slb
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    driver = MagicMock()
-    driver.current_url = "https://example.com"
-    # Take the shared-driver fast path so no real browser is ever started.
-    monkeypatch.setattr(slb, "_shared_driver", driver)
-    engine.driver = driver
+    tab = make_tab(url="https://example.com")
+    engine.driver = tab
     engine._initialized = True
 
-    engine.is_user_logged_in = lambda: False
+    # Take the fast path so no real browser is ever started.
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.refresh_login_state = AsyncMock(return_value=False)
     engine._is_dead_session = lambda exc: False
-    engine._find_interactable_element = (
-        lambda driver, selectors, timeout, cache_attr=None: MagicMock()
-    )
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
-    # A MagicMock driver answers every lookup truthily, which would otherwise
-    # trip the captcha / usage-limit short circuits before the prompt is typed.
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
+    engine._find_interactable_element = AsyncMock(return_value=make_element())
+    engine._click_accept_buttons = AsyncMock(return_value=None)
+    # A default mock tab answers every lookup falsily/emptily, which is what
+    # keeps the captcha / usage-limit short circuits from tripping before the
+    # prompt is typed.
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
 
-    def _fail_fill_input(driver, element, prompt):
+    async def _fail_fill_input(tab, element, prompt):
         raise RuntimeError(
-            "[selenium] fill_input verification failed: prompt content did not "
+            "[zendriver] fill_input verification failed: prompt content did not "
             "match expected text"
         )
 
     engine._fill_input = _fail_fill_input
 
     with pytest.raises(RuntimeError, match="Unlogged session"):
-        engine._sync_generate_response_once("hello")
+        asyncio.run(engine._generate_response_once("hello"))
 
 
 def _stale_guard_engine(monkeypatch, stats_sequence, screen_text="OLD ANSWER"):
@@ -3776,16 +3792,15 @@ def _stale_guard_engine(monkeypatch, stats_sequence, screen_text="OLD ANSWER"):
 
     ``stats_sequence`` drives ``_get_response_container_stats`` so a test can
     decide whether the watcher observes generation activity or a page that never
-    moves. ``time.sleep`` is neutralised so the poll loop runs instantly.
+    moves. ``asyncio.sleep`` is neutralised so the poll loop runs instantly.
     """
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3794,26 +3809,33 @@ def _stale_guard_engine(monkeypatch, stats_sequence, screen_text="OLD ANSWER"):
     engine.response_area_selectors = ["div.response"]
     engine.stop_selectors = []
 
-    container = MagicMock()
+    container = make_element()
     stats = iter(stats_sequence)
     last_stat = stats_sequence[-1]
 
-    def _next_stats(driver, element):
+    async def _next_stats(_element):
         nonlocal last_stat
         last_stat = next(stats, last_stat)
         return last_stat
 
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
-    engine._stop_button_present = lambda driver: False
-    # A MagicMock driver answers every lookup truthily, which would otherwise
+    engine._click_accept_buttons = AsyncMock()
+    engine._stop_button_present = AsyncMock(return_value=False)
+    # A default mock tab answers every lookup emptily, which would otherwise
     # trip the captcha / usage-limit short circuits inside the wait loop.
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
     engine._log_response_container_diagnostics = lambda *a, **kw: None
-    engine._find_response_container_element = lambda driver: (container, "div.response")
+    engine._find_response_container_element = AsyncMock(return_value=(container, "div.response"))
     engine._get_response_container_stats = _next_stats
-    engine._get_latest_response_text = lambda driver: screen_text
-    engine._extract_response_text_from_element = lambda driver, element: screen_text
+
+    async def _get_latest(_tab):
+        return screen_text
+
+    async def _extract(_element):
+        return screen_text
+
+    engine._get_latest_response_text = _get_latest
+    engine._extract_response_text_from_element = _extract
     return engine
 
 
@@ -3824,13 +3846,11 @@ def test_wait_for_response_rejects_stale_previous_answer(monkeypatch):
     answer from the previous turn is perfectly stable, so it was returned as if
     freshly generated -- the caller then received the prior turn's reply.
     """
-    from unittest.mock import MagicMock
-
     # Metrics never move: nothing was ever generated on the page.
     engine = _stale_guard_engine(monkeypatch, [(10, 1)])
 
     with pytest.raises(RuntimeError, match="Stale response"):
-        engine._wait_for_response(MagicMock(), pre_send_text="OLD ANSWER")
+        asyncio.run(engine._wait_for_response(make_tab(), pre_send_text="OLD ANSWER"))
 
 
 def test_wait_for_response_allows_identical_answer_after_real_generation(
@@ -3841,13 +3861,11 @@ def test_wait_for_response_allows_identical_answer_after_real_generation(
     The stale guard keys on "no generation activity at all", so a model that
     legitimately repeats itself is not mistaken for a stale page.
     """
-    from unittest.mock import MagicMock
-
     # Metrics move first (generation observed), then settle.
     engine = _stale_guard_engine(monkeypatch, [(3, 1), (7, 1), (10, 1), (10, 1)])
 
     assert (
-        engine._wait_for_response(MagicMock(), pre_send_text="OLD ANSWER")
+        asyncio.run(engine._wait_for_response(make_tab(), pre_send_text="OLD ANSWER"))
         == "OLD ANSWER"
     )
 
@@ -3861,13 +3879,12 @@ def test_click_accept_buttons_handles_multi_step_consent(monkeypatch):
     leaving the previous answer on screen.
     """
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -3879,30 +3896,27 @@ def test_click_accept_buttons_handles_multi_step_consent(monkeypatch):
     expanded = {"value": False}
 
     def _element(name):
-        el = MagicMock()
-        el.is_displayed.return_value = True
-        el.is_enabled.return_value = True
+        el = make_element()
 
-        def _click():
+        async def _click():
             clicked.append(name)
             if name == "expand":
                 expanded["value"] = True
 
-        el.click.side_effect = _click
+        el.click = AsyncMock(side_effect=_click)
         return el
 
-    def _find_elements(_by, selector):
-        if selector == "button.expand":
+    async def _query_side_effect(sel):
+        if sel == "button.expand":
             return [_element("expand")]
         # The dismiss button only exists once the banner has been expanded.
-        if selector == "button.dismiss" and expanded["value"]:
+        if sel == "button.dismiss" and expanded["value"]:
             return [_element("dismiss")]
         return []
 
-    driver = MagicMock()
-    driver.find_elements.side_effect = _find_elements
+    tab = make_tab(query_selector_all=AsyncMock(side_effect=_query_side_effect))
 
-    engine._click_accept_buttons(driver, timeout=2.0)
+    asyncio.run(engine._click_accept_buttons(tab, timeout=2.0))
 
     assert clicked == ["expand", "dismiss"]
 
@@ -3915,13 +3929,11 @@ def test_wait_for_response_keeps_short_answer_already_complete(monkeypatch):
     so it equalled that read, showed no activity, and was rejected -- then
     re-sent up to five times by the retry loop.
     """
-    from unittest.mock import MagicMock
-
     # The page already shows the complete new answer and never moves again.
     engine = _stale_guard_engine(monkeypatch, [(18, 1)], screen_text="FRESH ANSWER")
 
     assert (
-        engine._wait_for_response(MagicMock(), pre_send_text="OLD ANSWER")
+        asyncio.run(engine._wait_for_response(make_tab(), pre_send_text="OLD ANSWER"))
         == "FRESH ANSWER"
     )
 
@@ -3929,11 +3941,9 @@ def test_wait_for_response_keeps_short_answer_already_complete(monkeypatch):
 def test_wait_for_response_without_pre_send_text_does_not_guess(monkeypatch):
     """With no pre-send snapshot the guard stays off instead of trusting a
     post-send read that may already contain the new answer."""
-    from unittest.mock import MagicMock
-
     engine = _stale_guard_engine(monkeypatch, [(10, 1)])
 
-    assert engine._wait_for_response(MagicMock()) == "OLD ANSWER"
+    assert asyncio.run(engine._wait_for_response(make_tab())) == "OLD ANSWER"
 
 
 class _StopAfterNavigation(Exception):
@@ -3944,41 +3954,36 @@ def _navigation_probe_engine(monkeypatch, *, fresh_chat: bool, retry_nav: bool =
     """Engine already sitting on its service URL, instrumented to record navigation."""
     import tempfile
     import time as _time
-    from unittest.mock import MagicMock
 
-    import core.selenium_llm_base as slb
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    driver = MagicMock()
-    driver.current_url = "https://example.com/app/used-conversation"
-    monkeypatch.setattr(slb, "_shared_driver", driver)
-    engine.driver = driver
+    tab = make_tab(url="https://example.com/app/used-conversation")
+    engine.driver = tab
     engine._initialized = True
     engine._driver_start_time = _time.time()
     engine._fresh_chat_per_request = fresh_chat
     engine._navigate_on_next_attempt = retry_nav
 
-    engine.is_user_logged_in = lambda: True
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.refresh_login_state = AsyncMock(return_value=True)
     engine._is_dead_session = lambda exc: False
-    engine._wait_for_page_ready = lambda driver, timeout=30.0: None
-    engine._click_accept_buttons = lambda driver, timeout=2.0: None
-    engine._is_captcha_present = lambda driver: False
-    engine._is_limit_present = lambda driver: False
-    engine._find_interactable_element = (
-        lambda driver, selectors, timeout, cache_attr=None: MagicMock()
-    )
+    engine._wait_for_page_ready = AsyncMock(return_value=None)
+    engine._click_accept_buttons = AsyncMock(return_value=None)
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._is_limit_present = AsyncMock(return_value=False)
+    engine._find_interactable_element = AsyncMock(return_value=make_element())
 
-    def _stop(driver, element, prompt):
+    async def _stop(tab, element, prompt):
         raise _StopAfterNavigation()
 
     engine._fill_input = _stop
-    return engine, driver
+    return engine, tab
 
 
 def test_fresh_chat_per_request_navigates_even_on_service_url(monkeypatch):
@@ -3989,50 +3994,50 @@ def test_fresh_chat_per_request_navigates_even_on_service_url(monkeypatch):
     chat, where the send was clicked but never submitted, so only the first
     request after a driver reset ever succeeded.
     """
-    engine, driver = _navigation_probe_engine(monkeypatch, fresh_chat=True)
+    engine, tab = _navigation_probe_engine(monkeypatch, fresh_chat=True)
 
     with pytest.raises(_StopAfterNavigation):
-        engine._sync_generate_response_once("hello")
+        asyncio.run(engine._generate_response_once("hello"))
 
-    driver.get.assert_called_once_with("https://example.com")
+    tab.get.assert_called_once_with("https://example.com")
 
 
 def test_without_flag_the_used_page_is_reused(monkeypatch):
     """Engines that do not opt in keep the existing no-reload behaviour."""
-    engine, driver = _navigation_probe_engine(monkeypatch, fresh_chat=False)
+    engine, tab = _navigation_probe_engine(monkeypatch, fresh_chat=False)
 
     with pytest.raises(_StopAfterNavigation):
-        engine._sync_generate_response_once("hello")
+        asyncio.run(engine._generate_response_once("hello"))
 
-    driver.get.assert_not_called()
+    tab.get.assert_not_called()
 
 
 def test_session_hard_timeout_uses_graceful_reset_not_sigkill(monkeypatch):
     """The session-hard-timeout watchdog must quit Chrome gracefully, not SIGKILL it.
 
     Regression: it called _force_reset_driver(), which sends SIGKILL straight
-    to the Chrome process tree without ever calling driver.quit(). Chrome
-    batches its Cookies/IndexedDB writes to disk instead of flushing them
+    to the Chrome process tree without ever calling driver.quit()/browser.stop().
+    Chrome batches its Cookies/IndexedDB writes to disk instead of flushing them
     synchronously, so a SIGKILL landing mid-batch silently drops whatever the
     site had just written for the session -- e.g. Google rotating the Gemini
     auth cookie. Since this watchdog runs on every request once the driver has
     been alive past the timeout, it was force-logging the user out during
-    normal, active use. _reset_driver() gives driver.quit() up to 5s to finish
-    (falling back to a kill only if it hangs), so it must be used instead.
+    normal, active use. _reset_driver() gives the graceful stop path up to 5s to
+    finish (falling back to a kill only if it hangs), so it must be used instead.
     """
     import time as _time
 
-    engine, driver = _navigation_probe_engine(monkeypatch, fresh_chat=False)
+    engine, tab = _navigation_probe_engine(monkeypatch, fresh_chat=False)
     engine._driver_start_time = _time.time() - 999_999  # long past any timeout
     engine._session_hard_timeout = 300
 
     reset_calls = []
     force_reset_calls = []
-    engine._reset_driver = lambda: reset_calls.append(True)
-    engine._force_reset_driver = lambda: force_reset_calls.append(True)
+    engine._reset_driver = AsyncMock(side_effect=lambda: reset_calls.append(True))
+    engine._force_reset_driver = AsyncMock(side_effect=lambda: force_reset_calls.append(True))
 
     with pytest.raises(_StopAfterNavigation):
-        engine._sync_generate_response_once("hello")
+        asyncio.run(engine._generate_response_once("hello"))
 
     assert reset_calls == [True]
     assert force_reset_calls == []
@@ -4040,14 +4045,14 @@ def test_session_hard_timeout_uses_graceful_reset_not_sigkill(monkeypatch):
 
 def test_retry_after_failed_attempt_opens_a_fresh_chat(monkeypatch):
     """A failed attempt must not be retried in place on the same page."""
-    engine, driver = _navigation_probe_engine(
+    engine, tab = _navigation_probe_engine(
         monkeypatch, fresh_chat=False, retry_nav=True
     )
 
     with pytest.raises(_StopAfterNavigation):
-        engine._sync_generate_response_once("hello")
+        asyncio.run(engine._generate_response_once("hello"))
 
-    driver.get.assert_called_once_with("https://example.com")
+    tab.get.assert_called_once_with("https://example.com")
     # The one-shot flag is consumed by the navigation it triggered.
     assert engine._navigate_on_next_attempt is False
 
@@ -4056,10 +4061,10 @@ def test_failed_attempt_flags_navigation_for_the_next_one(monkeypatch):
     """The retry loop raises the flag between a failed attempt and the next."""
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
-    engine = SeleniumLLMBase(
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -4067,7 +4072,7 @@ def test_failed_attempt_flags_navigation_for_the_next_one(monkeypatch):
     )
     seen: list[bool] = []
 
-    def _attempt(prompt, media=None):
+    async def _attempt(prompt, media=None):
         seen.append(engine._navigate_on_next_attempt)
         if len(seen) == 1:
             raise RuntimeError(
@@ -4076,9 +4081,9 @@ def test_failed_attempt_flags_navigation_for_the_next_one(monkeypatch):
             )
         return "ok"
 
-    engine._sync_generate_response_once = _attempt
+    engine._generate_response_once = _attempt
 
-    assert engine._sync_generate_response("hello") == "ok"
+    assert asyncio.run(engine._generate_response_retry_loop("hello")) == "ok"
     assert seen == [False, True]
 
 
@@ -4087,10 +4092,10 @@ def test_failed_attempt_is_logged_before_retry(monkeypatch, caplog):
     import logging
     import tempfile
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    monkeypatch.setattr("time.sleep", lambda *_a, **_kw: None)
-    engine = SeleniumLLMBase(
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
@@ -4098,16 +4103,16 @@ def test_failed_attempt_is_logged_before_retry(monkeypatch, caplog):
     )
     calls = {"n": 0}
 
-    def _attempt(prompt, media=None):
+    async def _attempt(prompt, media=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("final chunk never submitted")
         return "ok"
 
-    engine._sync_generate_response_once = _attempt
+    engine._generate_response_once = _attempt
 
-    with caplog.at_level(logging.WARNING, logger="selenium_llm_base"):
-        assert engine._sync_generate_response("hello") == "ok"
+    with caplog.at_level(logging.WARNING, logger="zendriver_llm_base"):
+        assert asyncio.run(engine._generate_response_retry_loop("hello")) == "ok"
 
     assert "Attempt 1/5 failed: final chunk never submitted" in caplog.text
 
@@ -4115,59 +4120,59 @@ def test_failed_attempt_is_logged_before_retry(monkeypatch, caplog):
 def _failing_js_insert_engine(monkeypatch):
     """Engine whose editor never accepts the JS insert (read-back stays empty)."""
     import tempfile
-    from unittest.mock import MagicMock
 
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
-    engine = SeleniumLLMBase(
+    engine = ZendriverLLMBase(
         service_url="https://example.com",
         model_limits_map={"default": 1000},
         default_model="default",
         profile_dir=tempfile.mkdtemp(),
     )
-    driver = MagicMock()
-    driver.execute_script.return_value = ""  # editor reads back empty → never verified
-    element = MagicMock()
-    element.tag_name = "div"  # contenteditable path
-    return engine, driver, element
+    tab = make_tab()
+    # editor reads back empty -> never verified, regardless of the JS body
+    element = make_element(tag="div", apply_result="")
+    return engine, tab, element
 
 
 def test_fill_input_never_types_non_bmp_text(monkeypatch):
     """Text containing emoji must never reach send_keys.
 
     Regression: when the JS insert could not be verified, the fallback typed the
-    text through ChromeDriver, which cannot emit anything outside the Basic
+    text through the keyboard, which cannot emit anything outside the Basic
     Multilingual Plane: every turn carrying an emoji died with "only supports
     characters in the BMP" and the reply never came.
     """
-    engine, driver, element = _failing_js_insert_engine(monkeypatch)
+    engine, tab, element = _failing_js_insert_engine(monkeypatch)
 
     with pytest.raises(RuntimeError):
-        engine._fill_input(driver, element, "ciao 😵‍💫 come stai")
+        asyncio.run(engine._fill_input(tab, element, "ciao 😵‍💫 come stai"))
 
-    assert element.send_keys.call_count == 0
+    assert element.send_keys.await_count == 0
 
 
 def test_fill_input_never_types_very_long_text(monkeypatch):
-    """A huge prompt must not be typed: ChromeDriver times out doing it.
+    """A huge prompt must not be typed: real keyboard input would be too slow.
 
     Regression: a ~32k-char prompt sent through the keyboard fallback hit the
-    ChromeDriver HTTP read timeout after 120s and failed the whole request.
+    ChromeDriver HTTP read timeout after 120s and failed the whole request
+    (zendriver dispatches one CDP call per character, so the same concern
+    applies even though the transport changed).
     """
-    engine, driver, element = _failing_js_insert_engine(monkeypatch)
+    engine, tab, element = _failing_js_insert_engine(monkeypatch)
 
     with pytest.raises(RuntimeError):
-        engine._fill_input(driver, element, "x" * 20000)
+        asyncio.run(engine._fill_input(tab, element, "x" * 20000))
 
-    assert element.send_keys.call_count == 0
+    assert element.send_keys.await_count == 0
 
 
 def test_fill_input_still_types_short_plain_text(monkeypatch):
     """Short BMP-only text keeps using the keyboard fallback."""
-    engine, driver, element = _failing_js_insert_engine(monkeypatch)
+    engine, tab, element = _failing_js_insert_engine(monkeypatch)
 
     with pytest.raises(RuntimeError):
-        engine._fill_input(driver, element, "hello world")
+        asyncio.run(engine._fill_input(tab, element, "hello world"))
 
-    typed = [c.args[0] for c in element.send_keys.call_args_list if c.args]
+    typed = [c.args[0] for c in element.send_keys.await_args_list if c.args]
     assert "hello world" in typed

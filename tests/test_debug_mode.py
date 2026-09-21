@@ -1,17 +1,8 @@
-import sys
-import types
-
 import pytest
 from fastapi.testclient import TestClient
 
-# undetected_chromedriver may be unavailable in CI; provide a safe stub.
-if "undetected_chromedriver" not in sys.modules:
-    sys.modules["undetected_chromedriver"] = types.SimpleNamespace(
-        Chrome=lambda *args, **kwargs: None
-    )
-
-from app import app  # noqa: E402
-from core import debug_mode  # noqa: E402
+from app import app
+from core import debug_mode
 
 client = TestClient(app)
 

@@ -309,11 +309,11 @@ logging.getLogger().addHandler(_buf_handler)
 # every diagnosis needed `docker logs` and nothing survived a recreate -- the
 # per-step [timing] lines that explain a stuck prompt were simply unavailable
 # to anyone reading a mounted log directory.
-_LOG_DIR = Path(os.getenv("SELENIUM_LOG_DIR", "./logs"))
+_LOG_DIR = Path(os.getenv("ZEN_LOG_DIR", "./logs"))
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _file_handler = RotatingFileHandler(
-        _LOG_DIR / "selenium-llm-engine.log",
+        _LOG_DIR / "zen-llm-engine.log",
         maxBytes=20 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -328,7 +328,7 @@ except OSError as exc:  # pragma: no cover - read-only or absent mount
         "[logging] Cannot write log file in %s: %s", _LOG_DIR, exc
     )
 
-logger = logging.getLogger("selenium-llm-api")
+logger = logging.getLogger("zen-llm-api")
 
 
 # Signal handling for graceful shutdown
@@ -369,7 +369,7 @@ async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
         logger.warning(f"[shutdown] stop_all error: {exc}")
 
 
-app = FastAPI(title="Selenium LLM Engine", version="0.1", lifespan=_lifespan)
+app = FastAPI(title="Zen LLM Engine", version="0.1", lifespan=_lifespan)
 
 # Rate limiting (per ip, sliding window)
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -528,7 +528,7 @@ async def root() -> RedirectResponse:
 
 @app.get("/api/ping", response_model=PingResponse)
 async def ping() -> PingResponse:
-    return PingResponse(status="ok", service="selenium-llm-engine")
+    return PingResponse(status="ok", service="zen-llm-engine")
 
 
 @app.get("/api/engines")
@@ -550,6 +550,9 @@ async def api_debug_page_html(engine_name: str | None = None) -> HTMLResponse:
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
+    # `engine.driver` holds the engine's current zendriver Tab (the page-level
+    # handle equivalent of the old Selenium WebDriver) — see
+    # core/zendriver_llm_base.py for why the attribute name was kept.
     driver = getattr(engine, "driver", None)
     if not driver:
         raise HTTPException(
@@ -558,7 +561,7 @@ async def api_debug_page_html(engine_name: str | None = None) -> HTMLResponse:
         )
 
     try:
-        html = driver.page_source
+        html = await driver.get_content()
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -618,7 +621,7 @@ async def models() -> LegacyModelList:
             "id": engine_name,
             "object": "model",
             "created": created,
-            "owned_by": "selenium-llm-engine",
+"owned_by": "zen-llm-engine",
             # Legacy extra fields (kept for backward compat)
             "name": engine_name,
             "capabilities": _map_media_capabilities_to_model_caps(
@@ -770,7 +773,7 @@ async def v1_model_detail(model_id: str) -> Dict[str, Any]:
         "id": model_id,
         "object": "model",
         "created": int(time.time()),
-        "owned_by": "selenium-llm-engine",
+        "owned_by": "zen-llm-engine",
     }
 
 
@@ -816,7 +819,7 @@ async def openai_chat(req: Request) -> Any:
     unsupported_present = [key for key in unsupported_openai_params if key in data]
     if unsupported_present:
         logger.warning(
-            "[openai_compat] Ignoring unsupported OpenAI parameters for Selenium engines: %s",
+            "[openai_compat] Ignoring unsupported OpenAI parameters for browser engines: %s",
             unsupported_present,
         )
 
@@ -1295,6 +1298,58 @@ async def api_reset_state() -> Dict[str, Any]:
     return await reset_state()
 
 
+@app.post("/api/session/reset")
+async def reset_session() -> Dict[str, Any]:
+    """Gracefully reset the browser session: cancel in-flight requests, drain
+    every engine's queue, then cleanly restart the shared browser.
+
+    Unlike ``/api/session/kill`` (SIGKILL — can lose whatever session/login
+    state Chrome hadn't flushed to disk yet), this lets Chrome exit normally
+    so the native profile keeps the login intact. Unlike ``/reset`` (which
+    also wipes stats and prompt history), this only touches browser/queue
+    state, so it's the right button for "something's stuck" without wanting
+    to lose login or history.
+
+    Use this e.g. after switching engines mid-request left the shared
+    browser being driven by two requests at once.
+    """
+    global RESET_IN_PROGRESS
+    manager = EngineManager.get()
+    errors: list[str] = []
+
+    RESET_IN_PROGRESS = True
+    try:
+        try:
+            await _cancel_inflight_tasks()
+        except Exception as e:
+            logger.warning(f"[session_reset] cancel_inflight_tasks error: {e}")
+            errors.append(f"cancel: {e}")
+
+        try:
+            await manager.drain_queues()
+        except Exception as e:
+            logger.warning(f"[session_reset] drain_queues error: {e}")
+            errors.append(f"drain: {e}")
+
+        try:
+            await manager.stop_all()
+        except Exception as e:
+            logger.warning(f"[session_reset] stop_all error (continuing): {e}")
+            errors.append(f"stop_all: {e}")
+
+        manager.engines.clear()
+        manager.active_engine = None
+
+        message = (
+            "Session reset — browser restarted gracefully, login preserved, queue cleared"
+            if not errors
+            else f"Session reset with errors: {'; '.join(errors)}"
+        )
+        return {"status": "ok", "message": message}
+    finally:
+        RESET_IN_PROGRESS = False
+
+
 @app.post("/api/session/kill")
 async def kill_session() -> Dict[str, Any]:
     """Force-kill the browser session immediately (SIGKILL).
@@ -1303,7 +1358,7 @@ async def kill_session() -> Dict[str, Any]:
     doesn't work.  Engine instances stay in memory and will
     auto-reinitialise the browser on the next request.
     """
-    from core.selenium_llm_base import force_kill_session
+    from core.zendriver_llm_base import force_kill_session
 
     manager = EngineManager.get()
     errors: list[str] = []
@@ -1327,7 +1382,7 @@ async def kill_session() -> Dict[str, Any]:
 
     # Force-kill browser processes
     try:
-        await asyncio.to_thread(force_kill_session)
+        await force_kill_session()
     except Exception as e:
         logger.error(f"[kill_session] force_kill_session error: {e}")
         errors.append(f"kill: {e}")

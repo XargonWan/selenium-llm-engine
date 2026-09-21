@@ -7,8 +7,8 @@ FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
 # here so it is available inside this build stage for arch-aware COPY below.
 ARG TARGETARCH
 
-# --- Webtop / Selenium environment setup ---
-ENV TITLE="Selenium LLM Engine"
+# --- Webtop / Zen environment setup ---
+ENV TITLE="Zen LLM Engine"
 ENV PIXELFLUX_USE_XSHM=0 \
     PIXELFLUX_DISABLE_XSHM=1 \
     PIXELFLUX_NO_XSHM=1 \
@@ -51,12 +51,15 @@ RUN pip3 install --no-cache-dir gemini-cli || true
 
 # Install Chromium 148 fully offline from vendored .deb files.
 #
-# undetected-chromedriver 3.5.5 only supports Chromium <= 148. Debian
+# zendriver talks to a real, unmodified Chromium directly over the Chrome
+# DevTools Protocol (CDP) — there is no separate chromedriver binary at all,
+# so chromium-driver is no longer installed here (previously required to
+# keep undetected-chromedriver's uc.Chrome stealth patching working, and
+# version-pinned in lockstep with it). The 148 pin on chromium/chromium-common
+# itself is kept unchanged for this pass — it was not re-evaluated as part of
+# the zendriver migration and bumping it is a separate decision. Debian
 # bookworm-security no longer ships 148 (only 150 is available now), so we
 # vendor the exact 148 .deb packages in the repo and install them from disk.
-# This keeps undetected-chromedriver's stealth path (uc.Chrome) working; do
-# NOT bump to 150 without also upgrading undetected-chromedriver, or the
-# engine falls back to the non-stealth native webdriver.
 #
 # The .deb packages are Debian bookworm builds, but the base image is Ubuntu
 # Noble, so their runtime deps use Debian package names that Noble lacks
@@ -70,24 +73,23 @@ RUN pip3 install --no-cache-dir gemini-cli || true
 # multi-arch build produces both linux/amd64 and linux/arm64 images. TARGETARCH
 # selects the matching set at build time.
 #
-# Pinned: chromium / chromium-common / chromium-driver 148.0.7778.215-1~deb12u1
+# Pinned: chromium / chromium-common 148.0.7778.215-1~deb12u1
 COPY vendor/chromium148/${TARGETARCH}/ /tmp/chromium148/
 RUN apt-get update && \
     apt-get purge -y google-chrome google-chrome-stable || true && \
     # Install the vendored Debian-flavoured runtime deps first (offline), then
-    # the three Chromium 148 packages. dpkg resolves the local files with no
+    # the Chromium 148 packages. dpkg resolves the local files with no
     # network access. The trailing apt-get -f is a safety net that only pulls
     # from whatever repos the base image already trusts (no Debian repos added).
     dpkg -i /tmp/chromium148/deps/*.deb || true && \
     dpkg -i /tmp/chromium148/chromium-common.deb \
-            /tmp/chromium148/chromium.deb \
-            /tmp/chromium148/chromium-driver.deb || \
+            /tmp/chromium148/chromium.deb || \
     apt-get install -y -f --no-install-recommends && \
-    apt-mark hold chromium chromium-common chromium-driver && \
+    apt-mark hold chromium chromium-common && \
     rm -rf /tmp/chromium148 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     # Fail the build loudly if the browser did not land (previously masked by `|| true`).
-    chromium --version && chromedriver --version
+    chromium --version
 
 
 # Chromium profile setup (in /config/.config/chromium-synth — matches SyntH)
@@ -117,7 +119,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
-ENV SELENIUM_LLM_DB=/app/data/selenium_engine.db
+ENV ZEN_LLM_DB=/app/data/zen_engine.db
 ENV CHROMIUM_HEADLESS=0
 ENV PYTHONUNBUFFERED=1
 

@@ -1,14 +1,14 @@
-# selenium-llm-engine MCP server
+# zen-llm-engine MCP server
 
 A thin [MCP](https://modelcontextprotocol.io) server that exposes the
-already-running selenium-llm-engine's REST API (see `DEVELOPERS.md`) as
+already-running zen-llm-engine's REST API (see `DEVELOPERS.md`) as
 tools, so an agent (or Claude Code itself) can check login state, trigger a
 login flow, read debug page HTML / app logs, and reset or kill a stuck
 browser session — without shelling out to `curl`.
 
 It does not start, stop, or otherwise manage the container. The engine must
 already be running (`docker compose up`) and reachable at
-`SELENIUM_LLM_ENGINE_URL` (default `http://localhost:14848`).
+`ZEN_LLM_ENGINE_URL` (default `http://localhost:14848`).
 
 ## Setup
 
@@ -32,11 +32,11 @@ Add to `.mcp.json` at the repo root (already present):
 ```json
 {
   "mcpServers": {
-    "selenium-llm-engine": {
+    "zen-llm-engine": {
       "command": ".venv/bin/python",
       "args": ["mcp_server/server.py"],
       "env": {
-        "SELENIUM_LLM_ENGINE_URL": "http://localhost:14848"
+        "ZEN_LLM_ENGINE_URL": "http://localhost:14848"
       }
     }
   }
@@ -54,6 +54,7 @@ Add to `.mcp.json` at the repo root (already present):
 | `get_page_html` | `GET /api/debug/page-html` | For debugging selectors against the live DOM. |
 | `get_app_logs` | `GET /api/logs/app` | Incremental polling via `since`. |
 | `get_selector_hints` | `GET /api/engines/selector-hints` | Runtime-discovered selectors per engine. |
-| `reset_engines` | `POST /api/reset` | Graceful — prefer this over `kill_session`. |
+| `reset_engines` | `POST /api/reset` | Graceful, but also wipes stats/prompt history. |
+| `reset_session` | `POST /api/session/reset` | Graceful, login-preserving, does NOT wipe stats/history — prefer this for "something's stuck". |
 | `kill_session` | `POST /api/session/kill` | SIGKILL; can lose unflushed session/cookie state. Last resort. |
 | `ping` | `GET /api/ping` | Health check. |
