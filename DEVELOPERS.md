@@ -174,7 +174,7 @@ Use this when the site needs custom logic.
 ### Required class attributes
 
 ```python
-class MyEngine(SeleniumLLMBase):
+class MyEngine(ZendriverLLMBase):
     ENGINE_NAME         = "my_engine"        # unique ID
     ENGINE_ALIASES      = ["my_engine"]      # alternate names
     ENGINE_DISPLAY_NAME = "My Engine"        # UI label

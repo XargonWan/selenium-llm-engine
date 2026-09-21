@@ -8,7 +8,7 @@
 |-----------|------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
 | `main`    | [![CI Status](https://img.shields.io/github/actions/workflow/status/XargonWan/selenium-llm-engine/build-and-publish.yml)](https://github.com/xargonwan/selenium-llm-engine/actions)
 
-This repository provides a standalone, Docker-friendly Selenium-powered LLM engine proxy. It automates browser access to Web GPTs via Selenium to expose a simple OpenAI-compatible API and web admin UI.
+This repository provides a standalone, Docker-friendly LLM engine proxy. It automates browser access to Web GPTs via [zendriver](https://github.com/stephanlensky/zendriver) (a Chrome DevTools Protocol driver — no Selenium/chromedriver in the loop) to expose a simple OpenAI-compatible API and web admin UI.
 
 Feel free to submit pull requests with improvements, new engines, or engine definitions (`engines/*.json` or `engines/*.py`).
 
@@ -25,7 +25,7 @@ Feel free to submit pull requests with improvements, new engines, or engine defi
 
 ## Features
 
-- Selenium-based support web based LLM.
+- zendriver-based (Chrome DevTools Protocol) support for web-based LLMs.
 - Unified REST API endpoints:
   - `/api/ping`
   - `/api/engines`
@@ -330,7 +330,7 @@ This runs the same service under `http://localhost:14848` (and `https://localhos
 ## Directory structure
 
 - `app.py` - FastAPI entrypoint
-- `core/` - Selenium engine wrappers and manager
+- `core/` - zendriver engine wrappers and manager
 - `db/` - SQLite persistence helpers
 - `web/` - minimal static UI
 - `tests/` - API tests and `stress_test.py` (manual, excluded from CI)

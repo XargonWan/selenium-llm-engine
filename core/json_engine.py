@@ -1,4 +1,4 @@
-"""JsonEngine — a SeleniumLLMBase subclass driven entirely by a JSON config dict.
+"""JsonEngine — a ZendriverLLMBase subclass driven entirely by a JSON config dict.
 
 Any LLM web interface that follows the common pattern:
   1. Navigate to a URL
@@ -46,9 +46,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from selenium.webdriver.common.by import By
-
-from core.selenium_llm_base import SeleniumLLMBase
+from core.zendriver_llm_base import ZendriverLLMBase
 
 logger = logging.getLogger("json_engine")
 
@@ -72,15 +70,15 @@ def _validate(config: dict[str, Any], source: str) -> None:
         )
 
 
-class JsonEngine(SeleniumLLMBase):
-    """Selenium engine whose entire configuration is read from a JSON dict/file.
+class JsonEngine(ZendriverLLMBase):
+    """Zendriver engine whose entire configuration is read from a JSON dict/file.
 
     Parameters
     ----------
     source:
         Either a ``Path`` pointing to a ``.json`` file or a pre-parsed ``dict``.
     **kwargs:
-        Forwarded verbatim to :class:`~core.selenium_llm_base.SeleniumLLMBase`
+        Forwarded verbatim to :class:`~core.zendriver_llm_base.ZendriverLLMBase`
         (e.g. ``headless``, ``profile_dir``).
     """
 
@@ -168,7 +166,7 @@ class JsonEngine(SeleniumLLMBase):
 
     # ---------------------------------------------------------------------- login
 
-    def _ensure_logged_in(self, driver: Any) -> bool:  # type: ignore[override]
+    async def _ensure_logged_in(self, tab: Any) -> bool:  # type: ignore[override]
         """Generic login detection driven by ``login_detection`` config block.
 
         Detection steps (all optional — steps are skipped if the corresponding
@@ -182,22 +180,20 @@ class JsonEngine(SeleniumLLMBase):
         """
         cfg = self._login_cfg
         try:
-            current_url = (driver.current_url or "").lower()
+            current_url = (await self._current_url(tab)).lower()
 
             # Step 0 — authenticated element present on the current page
             auth_selectors: list[str] = cfg.get("authenticated_css_selectors", [])
             for css in auth_selectors:
-                try:
-                    els = driver.find_elements(By.CSS_SELECTOR, css)
-                    if els and any(_safe_displayed(e) for e in els):
+                els = await self._query_all(tab, css)
+                for e in els:
+                    if await self._element_is_displayed(e):
                         return True
-                except Exception:
-                    pass
 
             url_prefix: str = cfg.get("url_prefix", self.service_url)
             if url_prefix and not current_url.startswith(url_prefix):
-                driver.get(url_prefix)
-                current_url = (driver.current_url or "").lower()
+                await tab.get(url_prefix)
+                current_url = (await self._current_url(tab)).lower()
 
             # Step 2 — deny keywords in URL
             deny_keywords: list[str] = cfg.get("url_deny_keywords", [])
@@ -207,21 +203,17 @@ class JsonEngine(SeleniumLLMBase):
             # Step 3 — visible login button
             login_xpath: str = cfg.get("login_button_xpath", "")
             if login_xpath:
-                try:
-                    buttons = driver.find_elements(By.XPATH, login_xpath)
-                    if any(b.is_displayed() for b in buttons if _safe_displayed(b)):
+                buttons = await self._xpath_all(tab, login_xpath)
+                for b in buttons:
+                    if await self._element_is_displayed(b):
                         return False
-                except Exception:
-                    pass
 
             # Step 4 — authenticated element present after navigation
             for css in auth_selectors:
-                try:
-                    els = driver.find_elements(By.CSS_SELECTOR, css)
-                    if els and any(_safe_displayed(e) for e in els):
+                els = await self._query_all(tab, css)
+                for e in els:
+                    if await self._element_is_displayed(e):
                         return True
-                except Exception:
-                    pass
 
             # Step 5 — fallback
             return True
@@ -231,11 +223,3 @@ class JsonEngine(SeleniumLLMBase):
                 f"[json_engine:{self.ENGINE_NAME}] login check failed: {exc}"
             )
             return False
-
-
-def _safe_displayed(element: Any) -> bool:
-    """Return False instead of raising when ``is_displayed()`` fails."""
-    try:
-        return bool(element.is_displayed())
-    except Exception:
-        return False

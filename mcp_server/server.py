@@ -122,6 +122,19 @@ async def reset_engines() -> Any:
 
 
 @mcp.tool()
+async def reset_session() -> Any:
+    """Gracefully reset the browser session: cancel in-flight requests, drain every engine's queue, restart the browser cleanly.
+
+    Unlike reset_engines (/api/reset), this does NOT clear stats or prompt
+    history -- only browser/queue state. Unlike kill_session, it's graceful
+    (login-preserving). Use this when something looks stuck (e.g. two
+    engines fought over the one shared browser after switching mid-request)
+    but you don't want to lose login or history.
+    """
+    return await _request("POST", "/api/session/reset")
+
+
+@mcp.tool()
 async def kill_session() -> Any:
     """Hard-kill: SIGKILL the shared browser process immediately.
 

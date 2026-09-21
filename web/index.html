@@ -314,6 +314,7 @@
             </table>
             <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
                 <button onclick="clearState()" style="color:#c0392b; font-size:0.85rem;">&#x2716; Clear engine state</button>
+                <button id="reset-session-btn" onclick="resetSession()" style="font-size:0.85rem;">&#x1F504; Reset Session</button>
                 <button class="danger" id="kill-session-btn" onclick="killSession()" style="font-size:0.85rem;">&#x1F480; Kill Session</button>
             </div>
         </div>
@@ -756,6 +757,23 @@
                 alert('Reset failed: ' + err.message);
             }
             refreshStats();
+        }
+
+        async function resetSession() {
+            if (!confirm('\u{1F504} Reset Session?\n\nThis will cancel any in-flight request and CLEAR the pending queue for every engine, then restart the browser gracefully.\nLogin state is preserved (unlike Kill Session).\n\nContinue?')) {
+                return;
+            }
+            var btn = document.getElementById('reset-session-btn');
+            if (btn) { btn.disabled = true; btn.textContent = 'Resetting…'; }
+            try {
+                var res = await fetchJson('/api/session/reset', { method: 'POST' });
+                alert('✅ ' + res.message);
+            } catch (err) {
+                alert('❌ Reset session failed: ' + err.message);
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '\u{1F504} Reset Session'; }
+                refreshStats();
+            }
         }
 
         async function killSession() {

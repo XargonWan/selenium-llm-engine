@@ -54,6 +54,7 @@ Add to `.mcp.json` at the repo root (already present):
 | `get_page_html` | `GET /api/debug/page-html` | For debugging selectors against the live DOM. |
 | `get_app_logs` | `GET /api/logs/app` | Incremental polling via `since`. |
 | `get_selector_hints` | `GET /api/engines/selector-hints` | Runtime-discovered selectors per engine. |
-| `reset_engines` | `POST /api/reset` | Graceful — prefer this over `kill_session`. |
+| `reset_engines` | `POST /api/reset` | Graceful, but also wipes stats/prompt history. |
+| `reset_session` | `POST /api/session/reset` | Graceful, login-preserving, does NOT wipe stats/history — prefer this for "something's stuck". |
 | `kill_session` | `POST /api/session/kill` | SIGKILL; can lose unflushed session/cookie state. Last resort. |
 | `ping` | `GET /api/ping` | Health check. |

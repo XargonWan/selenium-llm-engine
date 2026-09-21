@@ -22,9 +22,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from selenium.webdriver.common.by import By
-
-from core.selenium_llm_base import SeleniumLLMBase
+from core.zendriver_llm_base import ZendriverLLMBase
 
 logger = logging.getLogger("my_engine")
 
@@ -59,7 +57,7 @@ ENGINE_DEFAULT_MODEL = "default"
 # ---------------------------------------------------------------------------
 
 
-class MyEngine(SeleniumLLMBase):
+class MyEngine(ZendriverLLMBase):
     """Custom engine for <fill in the site name>."""
 
     # These class-level attributes are picked up by EngineManager during scan.
@@ -79,6 +77,8 @@ class MyEngine(SeleniumLLMBase):
         )
 
         # Override the selector lists to match your target site's DOM.
+        # These are still plain CSS selector strings — only the engine that
+        # evaluates them (zendriver instead of Selenium) changed.
         self.prompt_area_selectors = [
             # Add CSS selectors for the prompt / chat input here.
             "div[contenteditable='true']",
@@ -99,18 +99,21 @@ class MyEngine(SeleniumLLMBase):
             "button[aria-label*='Stop']",
         ]
 
-    def _ensure_logged_in(self, driver: Any) -> bool:
+    async def _ensure_logged_in(self, tab: Any) -> bool:
         """Return True when the browser is in an authenticated state.
 
         The implementation below is a common starting point — adapt it to
-        match your site's actual authentication flow.
+        match your site's actual authentication flow. ``tab`` is the
+        zendriver ``Tab`` currently in use; every DOM lookup is async.
         """
         try:
             # 1. Navigate to the service URL if we are somewhere else.
-            if not driver.current_url.startswith(ENGINE_SERVICE_URL):
-                driver.get(ENGINE_SERVICE_URL)
+            current_url = await self._current_url(tab)
+            if not current_url.startswith(ENGINE_SERVICE_URL):
+                await tab.get(ENGINE_SERVICE_URL)
+                current_url = await self._current_url(tab)
 
-            current_url = driver.current_url.lower()
+            current_url = current_url.lower()
 
             # 2. Deny keywords in URL path → not logged in.
             deny_keywords = ["login", "signin", "auth"]
@@ -118,13 +121,14 @@ class MyEngine(SeleniumLLMBase):
                 return False
 
             # 3. Visible "Sign in" / "Log in" button → not logged in.
-            login_buttons = driver.find_elements(
-                By.XPATH,
+            login_buttons = await self._xpath_all(
+                tab,
                 "//button[contains(normalize-space(.), 'Log in') "
                 "or contains(normalize-space(.), 'Sign in')]",
             )
-            if any(b.is_displayed() for b in login_buttons):
-                return False
+            for b in login_buttons:
+                if await self._element_is_displayed(b):
+                    return False
 
             # 4. Authenticated element present → logged in.
             authenticated_selectors = [
@@ -133,9 +137,10 @@ class MyEngine(SeleniumLLMBase):
                 ".user-avatar",
             ]
             for css in authenticated_selectors:
-                els = driver.find_elements(By.CSS_SELECTOR, css)
-                if els and any(e.is_displayed() for e in els):
-                    return True
+                els = await self._query_all(tab, css)
+                for e in els:
+                    if await self._element_is_displayed(e):
+                        return True
 
             # 5. Fallback — assume logged in when there is no evidence otherwise.
             return True
@@ -148,12 +153,14 @@ class MyEngine(SeleniumLLMBase):
     # Optional overrides
     # -----------------------------------------------------------------------
     # Uncomment and implement the methods below only if you need to deviate
-    # from the base-class behaviour.
+    # from the base-class behaviour. All of them are coroutines now.
 
     # def get_current_model(self) -> str:
-    #     """Detect the currently selected model from the DOM."""
+    #     """Detect the currently selected model. Stays synchronous and
+    #     cache-based — see ZendriverLLMBase.is_user_logged_in's docstring
+    #     for why (it's called from non-async request handlers)."""
     #     ...
 
-    # def _sync_generate_response(self, prompt: str) -> str:
+    # async def _generate_response_once(self, prompt: str, media=None) -> str:
     #     """Completely custom prompt → response flow."""
     #     ...

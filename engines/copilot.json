@@ -7,8 +7,8 @@
   "default_model": "default",
   "allow_unlogged": false,
   "models": {
-    "unlogged": 28000,
-    "default": 28000
+    "unlogged": 10240,
+    "default": 10240
   },
   "selectors": {
     "prompt_area": [

@@ -13,7 +13,7 @@ Python definition (required for complex / custom logic)
     ``engines/`` directory is imported dynamically.  The module must expose
     **exactly one** class that:
 
-    * inherits from :class:`~core.selenium_llm_base.SeleniumLLMBase`
+    * inherits from :class:`~core.zendriver_llm_base.ZendriverLLMBase`
     * defines a class-level ``ENGINE_NAME: str`` attribute
     * optionally defines ``ENGINE_ALIASES: list[str]``
 
@@ -40,7 +40,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from core.selenium_llm_base import SeleniumLLMBase
+    from core.zendriver_llm_base import ZendriverLLMBase
 
 logger = logging.getLogger("engine_manager")
 
@@ -173,7 +173,7 @@ def _scan_json(path: Path) -> Optional[EngineDescriptor]:
 def _scan_python(path: Path) -> Optional[EngineDescriptor]:
     if path.name.startswith("_"):
         return None  # private / template files
-    from core.selenium_llm_base import SeleniumLLMBase  # lazy import to avoid heavy deps at startup
+    from core.zendriver_llm_base import ZendriverLLMBase  # lazy import to avoid heavy deps at startup
     try:
         spec = importlib.util.spec_from_file_location(f"engines._dyn.{path.stem}", path)
         if spec is None or spec.loader is None:
@@ -183,8 +183,8 @@ def _scan_python(path: Path) -> Optional[EngineDescriptor]:
 
         for _name, obj in inspect.getmembers(module, inspect.isclass):
             if (
-                obj is not SeleniumLLMBase
-                and issubclass(obj, SeleniumLLMBase)
+                obj is not ZendriverLLMBase
+                and issubclass(obj, ZendriverLLMBase)
                 and hasattr(obj, "ENGINE_NAME")
             ):
                 engine_name: str = obj.ENGINE_NAME
@@ -201,7 +201,7 @@ def _scan_python(path: Path) -> Optional[EngineDescriptor]:
                     source_path=str(path),
                 )
         logger.warning(
-            f"[engine_manager] No SeleniumLLMBase subclass with ENGINE_NAME in {path}"
+            f"[engine_manager] No ZendriverLLMBase subclass with ENGINE_NAME in {path}"
         )
         return None
     except Exception as exc:
@@ -260,9 +260,9 @@ def scan_engines(engines_dir: Path) -> dict[str, EngineDescriptor]:
 # ---------------------------------------------------------------------------
 
 
-def _instantiate(descriptor: EngineDescriptor, **kwargs) -> "SeleniumLLMBase":
+def _instantiate(descriptor: EngineDescriptor, **kwargs) -> "ZendriverLLMBase":
     """Create a live engine instance from its descriptor."""
-    from core.selenium_llm_base import SeleniumLLMBase  # lazy import to avoid heavy deps at startup
+    from core.zendriver_llm_base import ZendriverLLMBase  # lazy import to avoid heavy deps at startup
     if descriptor.source == "json":
         from core.json_engine import JsonEngine
 
@@ -277,8 +277,8 @@ def _instantiate(descriptor: EngineDescriptor, **kwargs) -> "SeleniumLLMBase":
         spec.loader.exec_module(module)  # type: ignore[attr-defined]
         for _name, obj in inspect.getmembers(module, inspect.isclass):
             if (
-                obj is not SeleniumLLMBase
-                and issubclass(obj, SeleniumLLMBase)
+                obj is not ZendriverLLMBase
+                and issubclass(obj, ZendriverLLMBase)
                 and getattr(obj, "ENGINE_NAME", None) == descriptor.name
             ):
                 return obj(**kwargs)
@@ -326,8 +326,8 @@ class EngineManager:
     _lock: Lock = Lock()
 
     def __init__(self) -> None:
-        self.engines: dict[str, SeleniumLLMBase] = {}
-        self.active_engine: Optional[SeleniumLLMBase] = None
+        self.engines: dict[str, ZendriverLLMBase] = {}
+        self.active_engine: Optional[ZendriverLLMBase] = None
         self.default_engine: str | None = None
         self._descriptors: dict[str, EngineDescriptor] = {}
         self._alias_map: dict[str, str] = {}  # alias → canonical name
@@ -406,7 +406,7 @@ class EngineManager:
             return key
         raise ValueError(f"Unknown engine: '{name}'")
 
-    def get_engine(self, name: str) -> SeleniumLLMBase:
+    def get_engine(self, name: str) -> ZendriverLLMBase:
         """Return (and lazy-instantiate) the engine identified by *name* or an alias."""
         canonical = self._resolve(name)
         if canonical not in self.engines:
@@ -415,7 +415,7 @@ class EngineManager:
             self.engines[canonical] = _instantiate(desc)
         return self.engines[canonical]
 
-    def set_active_engine(self, name: str) -> SeleniumLLMBase:
+    def set_active_engine(self, name: str) -> ZendriverLLMBase:
         engine = self.get_engine(name)
         self.active_engine = engine
         return engine
@@ -480,7 +480,7 @@ class EngineManager:
             return fallback
         raise ValueError("No engines registered")
 
-    def get_active_engine(self) -> SeleniumLLMBase:
+    def get_active_engine(self) -> ZendriverLLMBase:
         if not self.active_engine:
             raise RuntimeError("No active engine set")
         return self.active_engine
@@ -661,16 +661,67 @@ class EngineManager:
 
     # ---------------------------------------------------------------------- lifecycle
 
+    def _protected_pids(self) -> set[int]:
+        """Return the PIDs that must never be reaped as "orphans".
+
+        The currently active shared browser (see
+        core.zendriver_llm_base.get_shared_browser_pid) plus its whole
+        process tree (renderer/GPU child processes have their own,
+        independently-old start times, so protecting only the root PID would
+        still let a long-open tab's renderer get killed out from under it).
+
+        Regression: before this existed, `_cleanup_orphans` had no notion of
+        "in use" at all -- it killed *any* chromium process older than
+        SELENIUM_ORPHAN_AGE_THRESHOLD (default 600s), including the one
+        actively serving requests. This was masked for a long time because
+        the session-hard-timeout watchdog used to recycle the browser every
+        ~300s by default, always well under the 600s orphan threshold; once
+        that default was raised to hours (a long-lived shared browser is the
+        intended normal state), the orphan sweep started SIGKILLing the live
+        browser every 5 minutes, surfacing as an immediate CDP-transport
+        "no close frame received or sent" error on whatever request was
+        using it at the time.
+        """
+        from core.zendriver_llm_base import get_shared_browser_pid
+
+        root = get_shared_browser_pid()
+        if root is None:
+            return set()
+        protected = {root}
+        frontier = [root]
+        while frontier:
+            pid = frontier.pop()
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-P", str(pid)],
+                    check=False, capture_output=True, timeout=2, text=True,
+                )
+                children = [int(p) for p in result.stdout.split() if p.isdigit()]
+            except Exception:
+                children = []
+            for child in children:
+                if child not in protected:
+                    protected.add(child)
+                    frontier.append(child)
+        return protected
+
     def _cleanup_orphans(self) -> int:
         """Find and kill orphaned chromedriver / chromium processes.
 
         Kills processes that match known patterns and are older than the
-        configured ``SELENIUM_ORPHAN_AGE_THRESHOLD`` (default 600 s).
+        configured ``SELENIUM_ORPHAN_AGE_THRESHOLD`` (default 600 s) --
+        except the active shared browser's own process tree, see
+        ``_protected_pids``.
 
         Returns the number of processes killed.
         """
         orphan_age = int(os.getenv("SELENIUM_ORPHAN_AGE_THRESHOLD", "600"))
         killed = 0
+        protected = self._protected_pids()
+        # "chromedriver"/"undetected_chromedriver" no longer exist in the
+        # zendriver stack (no separate driver binary), kept here only so a
+        # stray leftover from a not-yet-restarted older deployment still gets
+        # reaped; "chromium"/"chrome" are what actually matches now.
         patterns = ["chromedriver", "undetected_chromedriver", "chromium", "chrome"]
         try:
             for pattern in patterns:
@@ -683,6 +734,8 @@ class EngineManager:
                         if not pid_str.isdigit():
                             continue
                         pid = int(pid_str)
+                        if pid in protected:
+                            continue
                         # Check process age via /proc/<pid>/stat
                         try:
                             with open(f"/proc/{pid}/stat", "r") as f:
@@ -773,5 +826,5 @@ class EngineManager:
             except Exception:
                 pass
         # Actually terminate the shared browser now that all engines detached.
-        from core.selenium_llm_base import shutdown_shared_driver
-        shutdown_shared_driver()
+        from core.zendriver_llm_base import shutdown_shared_driver
+        await shutdown_shared_driver()
