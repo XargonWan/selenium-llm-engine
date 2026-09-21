@@ -1,11 +1,10 @@
 # Zen LLM Engine
 
-> **Zen LLM Engine — A hassle-free Web LLM engine**
->
+**Zen LLM Engine — A hassle-free Web LLM engine**
 > Disclaimer: this software has been vibe-coded.
->
-> > [!NOTE]
-> > This project was previously named **selenium-llm-engine**. It has been renamed to **Zen LLM Engine** to better reflect its zendriver-based architecture. For backward compatibility, the Docker image is also published under the old name `xargonwan/selenium-llm-engine:latest` (which will be deprecated in a future release). The legacy `SELENIUM_DEBUG` environment variable still works as an alias for `ZEN_DEBUG`.
+
+>  [!NOTE]
+> This project was previously named **selenium-llm-engine**. It has been renamed to **Zen LLM Engine** to better reflect its zendriver-based architecture. For backward compatibility, the Docker image is also published under the old name `xargonwan/selenium-llm-engine:latest` (which will be deprecated in a future release). The legacy `SELENIUM_DEBUG` environment variable still works as an alias for `ZEN_DEBUG`.
 
 ![Docker Pulls](https://img.shields.io/docker/pulls/xargonwan/zen-llm-engine)
 | Branch    | Build Status                                                                                                                                         | Docs Status                                                                                                                                      |
