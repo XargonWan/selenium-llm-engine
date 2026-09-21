@@ -813,6 +813,25 @@ class SeleniumLLMBase:
             logger.warning(f"[selenium] Error during Chromium cleanup: {e}")
 
     # ------------------------------------------------------------------ cookie persistence
+    #
+    # Login state is NOT persisted through these methods — they are kept as
+    # no-op hooks (and still called from the usual places) so future engines
+    # can opt back in without re-plumbing call sites. Persistence instead
+    # relies entirely on Chrome's native `--user-data-dir` profile
+    # (`self.profile_dir`, normally a mounted volume — see CHROMIUM_PROFILE_DIR),
+    # exactly like a normal desktop browser: its cookie/IndexedDB/localStorage
+    # stores are written in a crash-resilient format (SQLite WAL) that
+    # survives an unclean exit reasonably well on its own. A prior version of
+    # this file added a second layer on top -- a periodic CDP-based snapshot
+    # of every cookie, reapplied on the next driver creation -- but that was
+    # removed: replaying an old snapshot of a short-lived, rotating
+    # anti-replay cookie (e.g. Google's __Secure-1PSIDTS) can itself look like
+    # session hijacking to the site's own security systems and trigger the
+    # very logout it was meant to prevent (observed live against Gemini). For
+    # native persistence to work, Chrome must still be allowed to exit
+    # normally (driver.quit()) so it flushes those stores to disk — never
+    # SIGKILL it directly (see the session-hard-timeout watchdog in
+    # _sync_generate_response_once).
 
     def _cookie_path(self) -> str:
         """Return the file path for persisted cookies of this engine."""
@@ -820,15 +839,15 @@ class SeleniumLLMBase:
         return os.path.join(self.profile_dir, f"cookies_{engine_name}.json")
 
     def _save_cookies(self) -> None:
-        """Persist current browser cookies to a JSON file (atomic write)."""
+        """No-op — see the module note above cookie persistence."""
         pass
 
     def _restore_cookies(self) -> None:
-        """Load previously saved cookies into the browser session."""
+        """No-op — see the module note above cookie persistence."""
         self._cookies_restored = True
 
     def _maybe_save_cookies(self) -> None:
-        """Disabled."""
+        """No-op — see the module note above cookie persistence."""
         pass
 
     # ------------------------------------------------------------------ readiness
@@ -1565,18 +1584,29 @@ class SeleniumLLMBase:
         t0 = time.time()
         
         # Session hard timeout watchdog: if the driver has been alive longer than
-        # the session hard timeout, force-reset it to prevent renderer processes
-        # from running indefinitely (e.g. 2+ days at 27.6% CPU).
+        # the session hard timeout, recycle it to prevent renderer processes from
+        # running indefinitely (e.g. 2+ days at 27.6% CPU).
+        #
+        # Use the graceful _reset_driver() (driver.quit() with a timeout, falling
+        # back to a kill only if quit() hangs) rather than _force_reset_driver()
+        # (unconditional SIGKILL). Chrome batches its Cookies/IndexedDB writes to
+        # disk instead of flushing them synchronously, so a SIGKILL landing
+        # mid-batch silently drops whatever the site had just written for the
+        # session — e.g. Google rotating a Gemini auth cookie. Because this
+        # watchdog fires on a live, responsive driver (unlike
+        # _sync_generate_response's own timeout path, which resorts to
+        # force-reset only because the thread driving the browser is stuck),
+        # quit() is expected to succeed and persist state normally.
         session_hard_timeout = self._session_hard_timeout
         if session_hard_timeout is None:
-            session_hard_timeout = int(os.getenv("SELENIUM_SESSION_HARD_TIMEOUT", "300"))
+            session_hard_timeout = int(os.getenv("SELENIUM_SESSION_HARD_TIMEOUT", "21600"))
         if hasattr(self, '_driver_start_time') and self._driver_start_time:
             if (time.time() - self._driver_start_time) > session_hard_timeout:
                 logger.warning(
-                    "[selenium] Session hard timeout (%ds) exceeded — force-resetting driver",
+                    "[selenium] Session hard timeout (%ds) exceeded — resetting driver",
                     session_hard_timeout,
                 )
-                self._force_reset_driver()
+                self._reset_driver()
                 # Re-initialize after reset
                 self._ensure_ready()
                 assert self.driver is not None

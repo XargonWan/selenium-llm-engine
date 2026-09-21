@@ -4,8 +4,10 @@ set -e
 # Ensure config directory exists and is writable (matches SyntH pattern)
 mkdir -p /config/.config/chromium-synth
 mkdir -p /app/data
+mkdir -p /app/logs
 sudo chmod a+rwx -R /config 2>/dev/null || chmod -R 775 /config 2>/dev/null || true
 chown -R abc:abc /app/data 2>/dev/null || true
+chown -R abc:abc /app/logs 2>/dev/null || true
 
 echo "[S6 uvicorn] Waiting for /tmp/.X11-unix/X1 (up to 30s)..."
 WAIT_SECONDS=30

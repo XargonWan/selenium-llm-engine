@@ -2,11 +2,14 @@
 
 ## General purpose
 This document defines the expected behavior of agents working on this repository.
+For runtime behavior, gotchas and operational context (session/login
+persistence, local Docker workflow, the MCP server), see `CLAUDE.md`.
 
 1. Check and verify documentation
    - Read and align with the instructions and features defined in:
      - `README.md`
      - `DEVELOPERS.md`
+     - `CLAUDE.md`
    - Ensure implementations and APIs follow documented usage flows.
 
 2. Diagnose LOGs

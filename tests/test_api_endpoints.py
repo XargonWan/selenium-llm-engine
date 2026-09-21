@@ -998,6 +998,86 @@ def test_json_engine_loads_error_indicator_selectors():
     assert "simple-snack-bar" in " ".join(engine.error_indicator_selectors)
 
 
+def test_gemini_authenticated_selectors_exclude_chat_ui():
+    """Chat input/response classes must not be treated as a login signal.
+
+    Regression: gemini.json's allow_unlogged=true means Gemini's own chat UI
+    (div.assistant-message, .gemini-response, .chat-message.ai,
+    div.chat-input-container) renders identically for anonymous and signed-in
+    users, so using them as authenticated_css_selectors made the check assume
+    "logged in" (via the fallback in _ensure_logged_in) even while a real
+    "Sign in" button was visible on the page.
+    """
+    from pathlib import Path
+
+    from core.json_engine import JsonEngine
+
+    engines_dir = Path(__file__).parent.parent / "engines"
+    engine = JsonEngine(engines_dir / "gemini.json")
+
+    joined = " ".join(engine._login_cfg.get("authenticated_css_selectors", []))
+    for weak in ("chat-input-container", "assistant-message", "gemini-response", "chat-message"):
+        assert weak not in joined, f"{weak!r} renders in Gemini's unlogged mode too"
+
+
+def test_gemini_login_detection_flags_signed_out_state_correctly():
+    """Reproduces the exact page state observed live in production: the chat
+    UI is present (Gemini's anonymous mode renders it too) alongside a real
+    "Sign in" link -- must be detected as logged out, not fall through to
+    the "assume logged in" default."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from core.json_engine import JsonEngine
+
+    engines_dir = Path(__file__).parent.parent / "engines"
+    engine = JsonEngine(engines_dir / "gemini.json")
+    login_xpath = engine._login_cfg["login_button_xpath"]
+
+    driver = MagicMock()
+    driver.current_url = "https://gemini.google.com/"
+
+    def _find_elements(by, selector):
+        if selector == login_xpath:
+            el = MagicMock()
+            el.is_displayed.return_value = True
+            return [el]
+        return []  # no Google Account button / logout link -- signed out
+
+    driver.find_elements.side_effect = _find_elements
+
+    assert engine._ensure_logged_in(driver) is False
+
+
+def test_gemini_login_detection_flags_signed_in_state():
+    """Uses the actual markup observed on a real, logged-in Gemini page:
+    an <a aria-label="Google Account: ..."> (not a <button>) and a
+    SignOutOptions link (not "logout") -- the selectors must match the real
+    tag/wording, not a guess."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from core.json_engine import JsonEngine
+
+    engines_dir = Path(__file__).parent.parent / "engines"
+    engine = JsonEngine(engines_dir / "gemini.json")
+    account_selector = engine._login_cfg["authenticated_css_selectors"][0]
+
+    driver = MagicMock()
+    driver.current_url = "https://gemini.google.com/"
+
+    def _find_elements(by, selector):
+        if selector == account_selector:
+            el = MagicMock()
+            el.is_displayed.return_value = True
+            return [el]
+        return []
+
+    driver.find_elements.side_effect = _find_elements
+
+    assert engine._ensure_logged_in(driver) is True
+
+
 def test_error_indicator_selectors_default_empty():
     """Engines without an ``error_indicators`` key keep an empty list so the
     base engine behaviour is unchanged (engine-agnostic default)."""
@@ -3211,27 +3291,75 @@ def test_wait_for_response_initial_phase_fallback_send_button_absent():
 
 # ---------------------------------------------------------------------------
 # Cookie persistence tests
+#
+# Persistence is intentionally a no-op here: it relies entirely on Chrome's
+# native --user-data-dir profile, like a normal desktop browser. A CDP-based
+# snapshot/restore layer was tried and removed -- replaying an old value of a
+# short-lived, rotating anti-replay cookie (e.g. Google's __Secure-1PSIDTS)
+# looked like session hijacking to the site's own security systems and
+# triggered the very logout it was meant to prevent (observed live against
+# Gemini). See the note above _save_cookies in core/selenium_llm_base.py.
 # ---------------------------------------------------------------------------
 
 
-def test_save_cookies_writes_json(tmp_path):
-    pass
+def test_save_cookies_is_a_noop(tmp_path):
+    """No custom persistence — Chrome's own profile is the only mechanism."""
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.driver = MagicMock()
+
+    engine._save_cookies()
+
+    engine.driver.execute_cdp_cmd.assert_not_called()
+    engine.driver.get_cookies.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_save_cookies_noop_without_driver(tmp_path):
-    pass
+def test_restore_cookies_is_a_noop_but_marks_restored(tmp_path):
+    from unittest.mock import MagicMock
+
+    from core.selenium_llm_base import SeleniumLLMBase
+
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.driver = MagicMock()
+
+    engine._restore_cookies()
+
+    engine.driver.execute_cdp_cmd.assert_not_called()
+    engine.driver.add_cookie.assert_not_called()
+    assert engine._cookies_restored is True
 
 
-def test_restore_cookies_loads_json(tmp_path):
-    pass
+def test_maybe_save_cookies_is_a_noop_regardless_of_interval(tmp_path):
+    from unittest.mock import MagicMock
 
+    from core.selenium_llm_base import SeleniumLLMBase
 
-def test_restore_cookies_noop_when_file_missing(tmp_path):
-    pass
+    engine = SeleniumLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=str(tmp_path),
+    )
+    engine.driver = MagicMock()
+    engine._last_cookie_save = 0  # long ago -- would have tripped the old throttle
 
+    engine._maybe_save_cookies()
 
-def test_maybe_save_cookies_respects_interval(tmp_path):
-    pass
+    engine.driver.execute_cdp_cmd.assert_not_called()
 
 
 def test_cookie_path_uses_engine_name(tmp_path):
@@ -3877,6 +4005,37 @@ def test_without_flag_the_used_page_is_reused(monkeypatch):
         engine._sync_generate_response_once("hello")
 
     driver.get.assert_not_called()
+
+
+def test_session_hard_timeout_uses_graceful_reset_not_sigkill(monkeypatch):
+    """The session-hard-timeout watchdog must quit Chrome gracefully, not SIGKILL it.
+
+    Regression: it called _force_reset_driver(), which sends SIGKILL straight
+    to the Chrome process tree without ever calling driver.quit(). Chrome
+    batches its Cookies/IndexedDB writes to disk instead of flushing them
+    synchronously, so a SIGKILL landing mid-batch silently drops whatever the
+    site had just written for the session -- e.g. Google rotating the Gemini
+    auth cookie. Since this watchdog runs on every request once the driver has
+    been alive past the timeout, it was force-logging the user out during
+    normal, active use. _reset_driver() gives driver.quit() up to 5s to finish
+    (falling back to a kill only if it hangs), so it must be used instead.
+    """
+    import time as _time
+
+    engine, driver = _navigation_probe_engine(monkeypatch, fresh_chat=False)
+    engine._driver_start_time = _time.time() - 999_999  # long past any timeout
+    engine._session_hard_timeout = 300
+
+    reset_calls = []
+    force_reset_calls = []
+    engine._reset_driver = lambda: reset_calls.append(True)
+    engine._force_reset_driver = lambda: force_reset_calls.append(True)
+
+    with pytest.raises(_StopAfterNavigation):
+        engine._sync_generate_response_once("hello")
+
+    assert reset_calls == [True]
+    assert force_reset_calls == []
 
 
 def test_retry_after_failed_attempt_opens_a_fresh_chat(monkeypatch):

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "selenium-llm-engine": {
+      "command": ".venv/bin/python",
+      "args": ["mcp_server/server.py"],
+      "env": {
+        "SELENIUM_LLM_ENGINE_URL": "http://localhost:14848"
+      }
+    }
+  }
+}
